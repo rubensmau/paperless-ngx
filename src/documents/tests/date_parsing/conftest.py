@@ -24,7 +24,7 @@ def base_config() -> DateParserConfig:
             12,
             0,
             0,
-            tzinfo=datetime.timezone.utc,
+            tzinfo=datetime.UTC,
         ),
         filename_date_order="YMD",
         content_date_order="DMY",
@@ -45,7 +45,7 @@ def config_with_ignore_dates() -> DateParserConfig:
             12,
             0,
             0,
-            tzinfo=datetime.timezone.utc,
+            tzinfo=datetime.UTC,
         ),
         filename_date_order="DMY",
         content_date_order="MDY",
@@ -70,7 +70,7 @@ def clear_lru_cache() -> Generator[None, None, None]:
 
 
 @pytest.fixture
-def mock_date_parser_settings(settings: pytest_django.fixtures.SettingsWrapper) -> Any:
+def mock_date_parser_settings(settings: pytest_django.fixtures.Settings) -> Any:
     """
     Override Django settings for the duration of date parser tests.
     """

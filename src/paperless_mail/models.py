@@ -301,6 +301,14 @@ class MailRule(document_models.ModelWithOwner):
         default=True,
     )
 
+    stop_processing = models.BooleanField(
+        _("Stop processing further rules"),
+        default=False,
+        help_text=_(
+            "If True, no further rules will be processed after this one if any document is queued.",
+        ),
+    )
+
     def __str__(self):
         return f"{self.account.name}.{self.name}"
 
@@ -327,6 +335,14 @@ class ProcessedMail(document_models.ModelWithOwner):
         null=False,
         blank=False,
         max_length=256,
+        editable=False,
+    )
+
+    uid_validity = models.CharField(
+        _("uid validity"),
+        null=True,
+        blank=True,
+        max_length=64,
         editable=False,
     )
 

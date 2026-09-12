@@ -3,18 +3,20 @@ from unittest import mock
 
 from django.contrib.auth.models import Permission
 from django.contrib.auth.models import User
-from django.utils import timezone
 from guardian.shortcuts import assign_perm
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from documents.models import Correspondent
-from documents.models import DocumentType
-from documents.models import Tag
+from documents.tests.factories import CorrespondentFactory
+from documents.tests.factories import DocumentTypeFactory
+from documents.tests.factories import TagFactory
 from documents.tests.utils import DirectoriesMixin
 from paperless_mail.models import MailAccount
 from paperless_mail.models import MailRule
 from paperless_mail.models import ProcessedMail
+from paperless_mail.tests.factories import MailAccountFactory
+from paperless_mail.tests.factories import MailRuleFactory
+from paperless_mail.tests.factories import ProcessedMailFactory
 from paperless_mail.tests.test_mail import BogusMailBox
 
 
@@ -24,7 +26,7 @@ class TestAPIMailAccounts(DirectoriesMixin, APITestCase):
     def setUp(self) -> None:
         self.bogus_mailbox = BogusMailBox()
 
-        patcher = mock.patch("paperless_mail.mail.MailBox")
+        patcher = mock.patch("paperless_mail.mail.PinnedMailBox")
         m = patcher.start()
         m.return_value = self.bogus_mailbox
         self.addCleanup(patcher.stop)
@@ -46,14 +48,12 @@ class TestAPIMailAccounts(DirectoriesMixin, APITestCase):
             - Configured mail accounts are provided
         """
 
-        account1 = MailAccount.objects.create(
+        account1 = MailAccountFactory(
             name="Email1",
             username="username1",
             password="password1",
             imap_server="server.example.com",
             imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
         )
 
         response = self.client.get(self.ENDPOINT)
@@ -108,6 +108,27 @@ class TestAPIMailAccounts(DirectoriesMixin, APITestCase):
         self.assertEqual(returned_account1.imap_security, account1["imap_security"])
         self.assertEqual(returned_account1.character_set, account1["character_set"])
 
+    def test_create_mail_account_requires_imap_port(self) -> None:
+        account = {
+            "name": "Email1",
+            "username": "username1",
+            "password": "password1",
+            "imap_server": "server.example.com",
+            "imap_security": MailAccount.ImapSecurity.SSL,
+            "character_set": "UTF-8",
+        }
+
+        for imap_port in (None, "missing"):
+            with self.subTest(imap_port=imap_port):
+                data = account.copy()
+                if imap_port is None:
+                    data["imap_port"] = None
+
+                response = self.client.post(self.ENDPOINT, data=data, format="json")
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn("imap_port", response.data)
+
     def test_delete_mail_account(self) -> None:
         """
         GIVEN:
@@ -118,15 +139,7 @@ class TestAPIMailAccounts(DirectoriesMixin, APITestCase):
             - Account is deleted
         """
 
-        account1 = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
+        account1 = MailAccountFactory()
 
         response = self.client.delete(
             f"{self.ENDPOINT}{account1.pk}/",
@@ -146,15 +159,7 @@ class TestAPIMailAccounts(DirectoriesMixin, APITestCase):
             - The mail account is updated, password only updated if not '****'
         """
 
-        account1 = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
+        account1 = MailAccountFactory()
 
         response = self.client.patch(
             f"{self.ENDPOINT}{account1.pk}/",
@@ -245,14 +250,11 @@ class TestAPIMailAccounts(DirectoriesMixin, APITestCase):
         THEN:
             - API returns success
         """
-        account = MailAccount.objects.create(
-            name="Email1",
+        account = MailAccountFactory(
             username="admin",
             password="secret",
             imap_server="server.example.com",
             imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
         )
 
         response = self.client.post(
@@ -272,6 +274,99 @@ class TestAPIMailAccounts(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["success"], True)
 
+    def test_mail_account_test_existing_no_global_perms(self) -> None:
+        """
+        GIVEN:
+            - Existing account without an owner
+            - User without any mail account permissions
+        WHEN:
+            - API call is made to test the account by id
+        THEN:
+            - API returns forbidden
+        """
+        account = MailAccountFactory(
+            username="admin",
+            password="secret",
+            imap_server="server.example.com",
+            imap_port=443,
+            owner=None,
+        )
+        user = User.objects.create_user(username="no_perms")
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(
+            f"{self.ENDPOINT}test/",
+            json.dumps(
+                {
+                    "id": account.pk,
+                    "imap_server": "server.example.com",
+                    "imap_port": 443,
+                    "imap_security": MailAccount.ImapSecurity.SSL,
+                    "username": "admin",
+                    "password": "******",
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.content.decode(), "Insufficient permissions")
+
+    def test_mail_account_test_existing_object_perms_only(self) -> None:
+        """
+        GIVEN:
+            - Existing account owned by another user
+            - User with an object level grant but no global change permission
+        WHEN:
+            - API call is made to test the account by id
+        THEN:
+            - API returns forbidden
+        """
+        owner = User.objects.create_user(username="account_owner")
+        account = MailAccountFactory(
+            username="admin",
+            password="secret",
+            imap_server="server.example.com",
+            imap_port=443,
+            owner=owner,
+        )
+        user = User.objects.create_user(username="object_perms_only")
+        assign_perm("change_mailaccount", user, account)
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(
+            f"{self.ENDPOINT}test/",
+            json.dumps(
+                {
+                    "id": account.pk,
+                    "imap_server": "server.example.com",
+                    "imap_port": 443,
+                    "imap_security": MailAccount.ImapSecurity.SSL,
+                    "username": "admin",
+                    "password": "******",
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_mail_account_test_existing_nonexistent_id_forbidden(self) -> None:
+        response = self.client.post(
+            f"{self.ENDPOINT}test/",
+            json.dumps(
+                {
+                    "id": 999999,
+                    "imap_server": "server.example.com",
+                    "imap_port": 443,
+                    "imap_security": MailAccount.ImapSecurity.SSL,
+                    "username": "admin",
+                    "password": "******",
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.content.decode(), "Insufficient permissions")
+
     def test_get_mail_accounts_owner_aware(self) -> None:
         """
         GIVEN:
@@ -284,51 +379,10 @@ class TestAPIMailAccounts(DirectoriesMixin, APITestCase):
 
         user2 = User.objects.create_user(username="temp_admin2")
 
-        account1 = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        account2 = MailAccount.objects.create(
-            name="Email2",
-            username="username2",
-            password="password2",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-        account2.owner = self.user
-        account2.save()
-
-        account3 = MailAccount.objects.create(
-            name="Email3",
-            username="username3",
-            password="password3",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-        account3.owner = user2
-        account3.save()
-
-        account4 = MailAccount.objects.create(
-            name="Email4",
-            username="username4",
-            password="password4",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-        account4.owner = user2
-        account4.save()
+        account1 = MailAccountFactory(name="Email1")
+        account2 = MailAccountFactory(name="Email2", owner=self.user)
+        _account3 = MailAccountFactory(name="Email3", owner=user2)
+        account4 = MailAccountFactory(name="Email4", owner=user2)
         assign_perm("view_mailaccount", self.user, account4)
 
         response = self.client.get(self.ENDPOINT)
@@ -361,31 +415,15 @@ class TestAPIMailRules(DirectoriesMixin, APITestCase):
             - Configured mail rules are provided
         """
 
-        account1 = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        rule1 = MailRule.objects.create(
+        account1 = MailAccountFactory()
+        rule1 = MailRuleFactory(
             name="Rule1",
             account=account1,
-            folder="INBOX",
             filter_from="from@example.com",
             filter_to="someone@somewhere.com",
             filter_subject="subject",
             filter_body="body",
             filter_attachment_filename_include="file.pdf",
-            maximum_age=30,
-            action=MailRule.MailAction.MARK_READ,
-            assign_title_from=MailRule.TitleSource.FROM_SUBJECT,
-            assign_correspondent_from=MailRule.CorrespondentSource.FROM_NOTHING,
-            order=0,
-            attachment_type=MailRule.AttachmentProcessing.ATTACHMENTS_ONLY,
         )
 
         response = self.client.get(self.ENDPOINT)
@@ -425,27 +463,10 @@ class TestAPIMailRules(DirectoriesMixin, APITestCase):
             - A new mail rule is created
         """
 
-        account1 = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        tag = Tag.objects.create(
-            name="t",
-        )
-
-        correspondent = Correspondent.objects.create(
-            name="c",
-        )
-
-        document_type = DocumentType.objects.create(
-            name="dt",
-        )
+        account1 = MailAccountFactory()
+        tag = TagFactory(name="t")
+        correspondent = CorrespondentFactory(name="c")
+        document_type = DocumentTypeFactory(name="dt")
 
         rule1 = {
             "name": "Rule1",
@@ -530,31 +551,8 @@ class TestAPIMailRules(DirectoriesMixin, APITestCase):
             - Rule is deleted
         """
 
-        account1 = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        rule1 = MailRule.objects.create(
-            name="Rule1",
-            account=account1,
-            folder="INBOX",
-            filter_from="from@example.com",
-            filter_subject="subject",
-            filter_body="body",
-            filter_attachment_filename_include="file.pdf",
-            maximum_age=30,
-            action=MailRule.MailAction.MARK_READ,
-            assign_title_from=MailRule.TitleSource.FROM_SUBJECT,
-            assign_correspondent_from=MailRule.CorrespondentSource.FROM_NOTHING,
-            order=0,
-            attachment_type=MailRule.AttachmentProcessing.ATTACHMENTS_ONLY,
-        )
+        account1 = MailAccountFactory()
+        rule1 = MailRuleFactory(account=account1)
 
         response = self.client.delete(
             f"{self.ENDPOINT}{rule1.pk}/",
@@ -574,31 +572,8 @@ class TestAPIMailRules(DirectoriesMixin, APITestCase):
             - The mail rule is updated
         """
 
-        account1 = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        rule1 = MailRule.objects.create(
-            name="Rule1",
-            account=account1,
-            folder="INBOX",
-            filter_from="from@example.com",
-            filter_subject="subject",
-            filter_body="body",
-            filter_attachment_filename_include="file.pdf",
-            maximum_age=30,
-            action=MailRule.MailAction.MARK_READ,
-            assign_title_from=MailRule.TitleSource.FROM_SUBJECT,
-            assign_correspondent_from=MailRule.CorrespondentSource.FROM_NOTHING,
-            order=0,
-            attachment_type=MailRule.AttachmentProcessing.ATTACHMENTS_ONLY,
-        )
+        account1 = MailAccountFactory()
+        rule1 = MailRuleFactory(account=account1)
 
         response = self.client.patch(
             f"{self.ENDPOINT}{rule1.pk}/",
@@ -614,6 +589,88 @@ class TestAPIMailRules(DirectoriesMixin, APITestCase):
         self.assertEqual(returned_rule1.name, "Updated Name 1")
         self.assertEqual(returned_rule1.action, MailRule.MailAction.DELETE)
 
+    def test_create_mail_rule_scopes_accounts(self) -> None:
+        other_user = User.objects.create_user(username="mail-owner")
+        foreign_account = MailAccountFactory(name="ForeignEmail", owner=other_user)
+
+        response = self.client.post(
+            self.ENDPOINT,
+            data={
+                "name": "Rule1",
+                "account": foreign_account.pk,
+                "folder": "INBOX",
+                "filter_from": "from@example.com",
+                "maximum_age": 30,
+                "action": MailRule.MailAction.MARK_READ,
+                "assign_title_from": MailRule.TitleSource.FROM_SUBJECT,
+                "assign_correspondent_from": MailRule.CorrespondentSource.FROM_NOTHING,
+                "order": 0,
+                "attachment_type": MailRule.AttachmentProcessing.ATTACHMENTS_ONLY,
+            },
+        )
+        missing_response = self.client.post(
+            self.ENDPOINT,
+            data={
+                "name": "Rule1",
+                "account": foreign_account.pk + 1000,
+                "folder": "INBOX",
+                "filter_from": "from@example.com",
+                "maximum_age": 30,
+                "action": MailRule.MailAction.MARK_READ,
+                "assign_title_from": MailRule.TitleSource.FROM_SUBJECT,
+                "assign_correspondent_from": MailRule.CorrespondentSource.FROM_NOTHING,
+                "order": 0,
+                "attachment_type": MailRule.AttachmentProcessing.ATTACHMENTS_ONLY,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(missing_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["account"][0].code, "does_not_exist")
+        self.assertEqual(missing_response.data["account"][0].code, "does_not_exist")
+        self.assertEqual(MailRule.objects.count(), 0)
+
+    def test_create_mail_rule_allowed_for_granted_account_change_permission(
+        self,
+    ) -> None:
+        other_user = User.objects.create_user(username="mail-owner")
+        foreign_account = MailAccountFactory(name="ForeignEmail", owner=other_user)
+        assign_perm("change_mailaccount", self.user, foreign_account)
+
+        response = self.client.post(
+            self.ENDPOINT,
+            data={
+                "name": "Rule1",
+                "account": foreign_account.pk,
+                "folder": "INBOX",
+                "filter_from": "from@example.com",
+                "maximum_age": 30,
+                "action": MailRule.MailAction.MARK_READ,
+                "assign_title_from": MailRule.TitleSource.FROM_SUBJECT,
+                "assign_correspondent_from": MailRule.CorrespondentSource.FROM_NOTHING,
+                "order": 0,
+                "attachment_type": MailRule.AttachmentProcessing.ATTACHMENTS_ONLY,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(MailRule.objects.get().account, foreign_account)
+
+    def test_update_mail_rule_forbidden_for_unpermitted_account(self) -> None:
+        own_account = MailAccountFactory()
+        other_user = User.objects.create_user(username="mail-owner")
+        foreign_account = MailAccountFactory(owner=other_user)
+        rule1 = MailRuleFactory(account=own_account)
+
+        response = self.client.patch(
+            f"{self.ENDPOINT}{rule1.pk}/",
+            data={"account": foreign_account.pk},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        rule1.refresh_from_db()
+        self.assertEqual(rule1.account, own_account)
+
     def test_get_mail_rules_owner_aware(self) -> None:
         """
         GIVEN:
@@ -625,54 +682,11 @@ class TestAPIMailRules(DirectoriesMixin, APITestCase):
         """
 
         user2 = User.objects.create_user(username="temp_admin2")
-
-        account1 = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        rule1 = MailRule.objects.create(
-            name="Rule1",
-            account=account1,
-            folder="INBOX",
-            filter_from="from@example1.com",
-            order=0,
-        )
-
-        rule2 = MailRule.objects.create(
-            name="Rule2",
-            account=account1,
-            folder="INBOX",
-            filter_from="from@example2.com",
-            order=1,
-        )
-        rule2.owner = self.user
-        rule2.save()
-
-        rule3 = MailRule.objects.create(
-            name="Rule3",
-            account=account1,
-            folder="INBOX",
-            filter_from="from@example3.com",
-            order=2,
-        )
-        rule3.owner = user2
-        rule3.save()
-
-        rule4 = MailRule.objects.create(
-            name="Rule4",
-            account=account1,
-            folder="INBOX",
-            filter_from="from@example4.com",
-            order=3,
-        )
-        rule4.owner = user2
-        rule4.save()
+        account1 = MailAccountFactory()
+        rule1 = MailRuleFactory(account=account1, order=0)
+        rule2 = MailRuleFactory(account=account1, order=1, owner=self.user)
+        MailRuleFactory(account=account1, order=2, owner=user2)
+        rule4 = MailRuleFactory(account=account1, order=3, owner=user2)
         assign_perm("view_mailrule", self.user, rule4)
 
         response = self.client.get(self.ENDPOINT)
@@ -692,15 +706,7 @@ class TestAPIMailRules(DirectoriesMixin, APITestCase):
         THEN:
             - The API should reject the request
         """
-        account = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
+        account = MailAccountFactory()
 
         rule_data = {
             "name": "Rule1",
@@ -746,72 +752,16 @@ class TestAPIProcessedMails(DirectoriesMixin, APITestCase):
             - Only unowned, owned by user or granted processed mails are provided
         """
         user2 = User.objects.create_user(username="temp_admin2")
-
-        account = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        rule = MailRule.objects.create(
-            name="Rule1",
-            account=account,
-            folder="INBOX",
-            filter_from="from@example.com",
-            order=0,
-        )
-
-        pm1 = ProcessedMail.objects.create(
+        rule = MailRuleFactory()
+        pm1 = ProcessedMailFactory(rule=rule)
+        pm2 = ProcessedMailFactory(
             rule=rule,
-            folder="INBOX",
-            uid="1",
-            subject="Subj1",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="SUCCESS",
-            error=None,
-        )
-
-        pm2 = ProcessedMail.objects.create(
-            rule=rule,
-            folder="INBOX",
-            uid="2",
-            subject="Subj2",
-            received=timezone.now(),
-            processed=timezone.now(),
             status="FAILED",
             error="err",
             owner=self.user,
         )
-
-        ProcessedMail.objects.create(
-            rule=rule,
-            folder="INBOX",
-            uid="3",
-            subject="Subj3",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="SUCCESS",
-            error=None,
-            owner=user2,
-        )
-
-        pm4 = ProcessedMail.objects.create(
-            rule=rule,
-            folder="INBOX",
-            uid="4",
-            subject="Subj4",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="SUCCESS",
-            error=None,
-        )
-        pm4.owner = user2
-        pm4.save()
+        ProcessedMailFactory(rule=rule, owner=user2)
+        pm4 = ProcessedMailFactory(rule=rule, owner=user2)
         assign_perm("view_processedmail", self.user, pm4)
 
         response = self.client.get(self.ENDPOINT)
@@ -830,62 +780,12 @@ class TestAPIProcessedMails(DirectoriesMixin, APITestCase):
         THEN:
             - Only processed mails for that rule are returned
         """
-        account = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        rule1 = MailRule.objects.create(
-            name="Rule1",
-            account=account,
-            folder="INBOX",
-            filter_from="from1@example.com",
-            order=0,
-        )
-        rule2 = MailRule.objects.create(
-            name="Rule2",
-            account=account,
-            folder="INBOX",
-            filter_from="from2@example.com",
-            order=1,
-        )
-
-        pm1 = ProcessedMail.objects.create(
-            rule=rule1,
-            folder="INBOX",
-            uid="r1-1",
-            subject="R1-A",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="SUCCESS",
-            error=None,
-            owner=self.user,
-        )
-        pm2 = ProcessedMail.objects.create(
-            rule=rule1,
-            folder="INBOX",
-            uid="r1-2",
-            subject="R1-B",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="FAILED",
-            error="e",
-        )
-        ProcessedMail.objects.create(
-            rule=rule2,
-            folder="INBOX",
-            uid="r2-1",
-            subject="R2-A",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="SUCCESS",
-            error=None,
-        )
+        account = MailAccountFactory()
+        rule1 = MailRuleFactory(account=account)
+        rule2 = MailRuleFactory(account=account)
+        pm1 = ProcessedMailFactory(rule=rule1, owner=self.user)
+        pm2 = ProcessedMailFactory(rule=rule1, status="FAILED", error="e")
+        ProcessedMailFactory(rule=rule2)
 
         response = self.client.get(f"{self.ENDPOINT}?rule={rule1.pk}")
 
@@ -903,70 +803,18 @@ class TestAPIProcessedMails(DirectoriesMixin, APITestCase):
             - Only the specified processed mails are deleted, respecting ownership and permissions
         """
         user2 = User.objects.create_user(username="temp_admin2")
-
-        account = MailAccount.objects.create(
-            name="Email1",
-            username="username1",
-            password="password1",
-            imap_server="server.example.com",
-            imap_port=443,
-            imap_security=MailAccount.ImapSecurity.SSL,
-            character_set="UTF-8",
-        )
-
-        rule = MailRule.objects.create(
-            name="Rule1",
-            account=account,
-            folder="INBOX",
-            filter_from="from@example.com",
-            order=0,
-        )
-
-        # unowned and owned by self, and one with explicit object perm
-        pm_unowned = ProcessedMail.objects.create(
+        rule = MailRuleFactory()
+        # unowned, owned by self, and one with explicit object perm
+        pm_unowned = ProcessedMailFactory(rule=rule)
+        pm_owned = ProcessedMailFactory(
             rule=rule,
-            folder="INBOX",
-            uid="u1",
-            subject="Unowned",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="SUCCESS",
-            error=None,
-        )
-        pm_owned = ProcessedMail.objects.create(
-            rule=rule,
-            folder="INBOX",
-            uid="u2",
-            subject="Owned",
-            received=timezone.now(),
-            processed=timezone.now(),
             status="FAILED",
             error="e",
             owner=self.user,
         )
-        pm_granted = ProcessedMail.objects.create(
-            rule=rule,
-            folder="INBOX",
-            uid="u3",
-            subject="Granted",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="SUCCESS",
-            error=None,
-            owner=user2,
-        )
+        pm_granted = ProcessedMailFactory(rule=rule, owner=user2)
         assign_perm("delete_processedmail", self.user, pm_granted)
-        pm_forbidden = ProcessedMail.objects.create(
-            rule=rule,
-            folder="INBOX",
-            uid="u4",
-            subject="Forbidden",
-            received=timezone.now(),
-            processed=timezone.now(),
-            status="SUCCESS",
-            error=None,
-            owner=user2,
-        )
+        pm_forbidden = ProcessedMailFactory(rule=rule, owner=user2)
 
         # Success for allowed items
         response = self.client.post(
@@ -1005,3 +853,60 @@ class TestAPIProcessedMails(DirectoriesMixin, APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_bulk_delete_requires_global_delete_permission(self) -> None:
+        owner = User.objects.create_user(username="mail_owner")
+        requester = User.objects.create_user(username="mail_deleter")
+        requester.user_permissions.add(
+            Permission.objects.get(codename="add_processedmail"),
+        )
+        mail = ProcessedMailFactory(owner=owner)
+        assign_perm("delete_processedmail", requester, mail)
+        self.client.force_authenticate(requester)
+
+        response = self.client.post(
+            f"{self.ENDPOINT}bulk_delete/",
+            data={"mail_ids": [mail.pk]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        requester.user_permissions.add(
+            Permission.objects.get(codename="delete_processedmail"),
+        )
+        requester = User.objects.get(pk=requester.pk)
+        self.client.force_authenticate(requester)
+        response = self.client.post(
+            f"{self.ENDPOINT}bulk_delete/",
+            data={"mail_ids": [mail.pk]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(ProcessedMail.objects.filter(pk=mail.pk).exists())
+
+    def test_bulk_delete_processed_mails_rejects_mixed_batch_atomically(self) -> None:
+        """
+        GIVEN:
+            - A permitted processed mail and one the user may not delete
+        WHEN:
+            - API call bulk deletes both in a single request
+        THEN:
+            - The request is rejected and neither mail is deleted
+        """
+        user2 = User.objects.create_user(username="temp_admin2")
+        rule = MailRuleFactory()
+        # Created first so it sorts ahead of the forbidden mail, i.e. the
+        # permission check has to cover the whole batch before deleting rather
+        # than rejecting only once it reaches the forbidden one.
+        pm_owned = ProcessedMailFactory(rule=rule, owner=self.user)
+        pm_forbidden = ProcessedMailFactory(rule=rule, owner=user2)
+
+        response = self.client.post(
+            f"{self.ENDPOINT}bulk_delete/",
+            data={"mail_ids": [pm_owned.id, pm_forbidden.id]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(ProcessedMail.objects.filter(id=pm_owned.id).exists())
+        self.assertTrue(ProcessedMail.objects.filter(id=pm_forbidden.id).exists())

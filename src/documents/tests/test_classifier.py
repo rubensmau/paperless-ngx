@@ -1,8 +1,9 @@
 import re
-import shutil
+import warnings
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import pytest
 from django.conf import settings
 from django.test import TestCase
@@ -11,6 +12,7 @@ from django.test import override_settings
 from documents.classifier import ClassifierModelCorruptError
 from documents.classifier import DocumentClassifier
 from documents.classifier import IncompatibleClassifierVersionError
+from documents.classifier import _predict_with_threshold
 from documents.classifier import load_classifier
 from documents.models import Correspondent
 from documents.models import Document
@@ -19,6 +21,8 @@ from documents.models import MatchingModel
 from documents.models import StoragePath
 from documents.models import Tag
 from documents.tests.utils import DirectoriesMixin
+from paperless.signed_pickle import HMAC_SIZE
+from paperless.signed_pickle import signed_pickle_dumps
 
 
 def dummy_preprocess(content: str, **kwargs):
@@ -265,6 +269,27 @@ class TestClassifier(DirectoriesMixin, TestCase):
             self.assertEqual(mock_preprocess_content.call_count, 2)
             self.assertEqual(mock_transform.call_count, 2)
 
+    def test_vectorize_recomputes_tampered_cache_entry(self) -> None:
+        cached = bytearray(signed_pickle_dumps(["cached vector"]))
+        cached[HMAC_SIZE] ^= 0xFF
+        self.classifier.data_vectorizer = mock.Mock()
+        self.classifier.data_vectorizer.transform.return_value = ["fresh vector"]
+
+        with (
+            mock.patch(
+                "documents.classifier.read_cache.get",
+                return_value=bytes(cached),
+            ),
+            mock.patch("documents.classifier.read_cache.set") as cache_set,
+            mock.patch("documents.classifier.read_cache.touch") as cache_touch,
+        ):
+            result = self.classifier._vectorize("content")
+
+        self.assertEqual(result, ["fresh vector"])
+        self.classifier.data_vectorizer.transform.assert_called_once()
+        cache_set.assert_called_once()
+        cache_touch.assert_not_called()
+
     def test_no_retrain_if_no_change(self) -> None:
         """
         GIVEN:
@@ -366,8 +391,7 @@ class TestClassifier(DirectoriesMixin, TestCase):
 
         self.assertCountEqual(new_classifier.predict_tags(self.doc2.content), [45, 12])
 
-    @mock.patch("documents.classifier.pickle.load")
-    def test_load_corrupt_file(self, patched_pickle_load: mock.MagicMock) -> None:
+    def test_load_corrupt_file(self) -> None:
         """
         GIVEN:
             - Corrupted classifier pickle file
@@ -378,36 +402,116 @@ class TestClassifier(DirectoriesMixin, TestCase):
         """
         self.generate_train_and_save()
 
-        # First load is the schema version,allow it
-        patched_pickle_load.side_effect = [DocumentClassifier.FORMAT_VERSION, OSError()]
+        # Write garbage data (valid HMAC length but invalid content)
+        Path(settings.MODEL_FILE).write_bytes(b"\x00" * 64)
 
         with self.assertRaises(ClassifierModelCorruptError):
             self.classifier.load()
-            patched_pickle_load.assert_called()
-
-        patched_pickle_load.reset_mock()
-        patched_pickle_load.side_effect = [
-            DocumentClassifier.FORMAT_VERSION,
-            ClassifierModelCorruptError(),
-        ]
 
         self.assertIsNone(load_classifier())
-        patched_pickle_load.assert_called()
+
+    def test_load_corrupt_pickle_valid_hmac(self) -> None:
+        """
+        GIVEN:
+            - A classifier file with valid HMAC but unparsable pickle data
+        WHEN:
+            - An attempt is made to load the classifier
+        THEN:
+            - The ClassifierModelCorruptError is raised
+        """
+        garbage_data = b"this is not valid pickle data"
+        signature = DocumentClassifier._compute_hmac(garbage_data)
+        Path(settings.MODEL_FILE).write_bytes(signature + garbage_data)
+
+        with self.assertRaises(ClassifierModelCorruptError):
+            self.classifier.load()
+
+    def test_load_tampered_file(self) -> None:
+        """
+        GIVEN:
+            - A classifier model file whose data has been modified
+        WHEN:
+            - An attempt is made to load the classifier
+        THEN:
+            - The ClassifierModelCorruptError is raised due to HMAC mismatch
+        """
+        self.generate_train_and_save()
+
+        raw = Path(settings.MODEL_FILE).read_bytes()
+        # Flip a byte in the data portion (after the 32-byte HMAC)
+        tampered = raw[:32] + bytes([raw[32] ^ 0xFF]) + raw[33:]
+        Path(settings.MODEL_FILE).write_bytes(tampered)
+
+        with self.assertRaises(ClassifierModelCorruptError):
+            self.classifier.load()
+
+    def test_load_wrong_secret_key(self) -> None:
+        """
+        GIVEN:
+            - A classifier model file signed with a different SECRET_KEY
+        WHEN:
+            - An attempt is made to load the classifier
+        THEN:
+            - The ClassifierModelCorruptError is raised due to HMAC mismatch
+        """
+        self.generate_train_and_save()
+
+        with override_settings(SECRET_KEY="different-secret-key"):
+            with self.assertRaises(ClassifierModelCorruptError):
+                self.classifier.load()
+
+    def test_load_truncated_file(self) -> None:
+        """
+        GIVEN:
+            - A classifier model file that is too short to contain an HMAC
+        WHEN:
+            - An attempt is made to load the classifier
+        THEN:
+            - The ClassifierModelCorruptError is raised
+        """
+        Path(settings.MODEL_FILE).write_bytes(b"\x00" * 16)
+
+        with self.assertRaises(ClassifierModelCorruptError):
+            self.classifier.load()
 
     def test_load_new_scikit_learn_version(self) -> None:
         """
         GIVEN:
-            - classifier pickle file created with a different scikit-learn version
+            - classifier pickle file triggers an InconsistentVersionWarning
         WHEN:
             - An attempt is made to load the classifier
         THEN:
-            - The classifier reports the warning was captured and processed
+            - IncompatibleClassifierVersionError is raised
         """
-        # TODO: This wasn't testing the warning anymore, as the schema changed
-        # but as it was implemented, it would require installing an old version
-        # rebuilding the file and committing that.  Not developer friendly
-        # Need to rethink how to pass the load through to a file with a single
-        # old model?
+        from sklearn.exceptions import InconsistentVersionWarning
+
+        self.generate_train_and_save()
+
+        fake_warning = warnings.WarningMessage(
+            message=InconsistentVersionWarning(
+                estimator_name="MLPClassifier",
+                current_sklearn_version="1.0",
+                original_sklearn_version="0.9",
+            ),
+            category=InconsistentVersionWarning,
+            filename="",
+            lineno=0,
+        )
+
+        real_catch_warnings = warnings.catch_warnings
+
+        class PatchedCatchWarnings(real_catch_warnings):
+            def __enter__(self):
+                w = super().__enter__()
+                w.append(fake_warning)
+                return w
+
+        with mock.patch(
+            "documents.classifier.warnings.catch_warnings",
+            PatchedCatchWarnings,
+        ):
+            with self.assertRaises(IncompatibleClassifierVersionError):
+                self.classifier.load()
 
     def test_one_correspondent_predict(self) -> None:
         c1 = Correspondent.objects.create(
@@ -522,6 +626,103 @@ class TestClassifier(DirectoriesMixin, TestCase):
         self.classifier.train()
         self.assertEqual(self.classifier.predict_storage_path(doc1.content), sp.pk)
         self.assertIsNone(self.classifier.predict_storage_path(doc2.content))
+
+    def test_predict_rejects_prediction_below_match_threshold(self) -> None:
+        """
+        GIVEN:
+            - Classifiers trained against test data with confident predictions
+        WHEN:
+            - CLASSIFIER_MATCH_THRESHOLD exceeds the model's confidence
+        THEN:
+            - Every predict_* method discards the match in favor of no match
+        """
+        c1 = Correspondent.objects.create(
+            name="c1",
+            matching_algorithm=Correspondent.MATCH_AUTO,
+        )
+        dt1 = DocumentType.objects.create(
+            name="dt1",
+            matching_algorithm=DocumentType.MATCH_AUTO,
+        )
+        sp1 = StoragePath.objects.create(
+            name="sp1",
+            matching_algorithm=StoragePath.MATCH_AUTO,
+        )
+
+        doc1 = Document.objects.create(
+            title="doc1",
+            content="this is a document from c1",
+            correspondent=c1,
+            document_type=dt1,
+            storage_path=sp1,
+            checksum="A",
+        )
+        Document.objects.create(
+            title="doc2",
+            content="this is a document from no one",
+            checksum="B",
+        )
+
+        self.classifier.train()
+
+        predictors = {
+            "correspondent": self.classifier.predict_correspondent,
+            "document_type": self.classifier.predict_document_type,
+            "storage_path": self.classifier.predict_storage_path,
+        }
+        # No real prediction can reach a confidence this high, so this
+        # isolates the threshold check from the model's actual output.
+        with override_settings(CLASSIFIER_MATCH_THRESHOLD=0.999999):
+            for name, predict in predictors.items():
+                with self.subTest(field=name):
+                    self.assertIsNone(predict(doc1.content))
+
+    def test_train_uses_balanced_sample_weight(self) -> None:
+        """
+        GIVEN:
+            - A training set with correspondents, document types and storage paths
+        WHEN:
+            - The classifier is trained
+        THEN:
+            - Each MLP classifier is fit with balanced sample weights, so that
+              over-represented classes don't dominate predictions
+        """
+        c1 = Correspondent.objects.create(
+            name="c1",
+            matching_algorithm=Correspondent.MATCH_AUTO,
+        )
+        dt1 = DocumentType.objects.create(
+            name="dt1",
+            matching_algorithm=DocumentType.MATCH_AUTO,
+        )
+        sp1 = StoragePath.objects.create(
+            name="sp1",
+            matching_algorithm=StoragePath.MATCH_AUTO,
+        )
+
+        Document.objects.create(
+            title="doc1",
+            content="this is a document from c1",
+            correspondent=c1,
+            document_type=dt1,
+            storage_path=sp1,
+            checksum="A",
+        )
+        Document.objects.create(
+            title="doc2",
+            content="this is a document from no one",
+            checksum="B",
+        )
+
+        with mock.patch(
+            "sklearn.utils.class_weight.compute_sample_weight",
+            return_value=None,
+        ) as mocked_compute_sample_weight:
+            self.classifier.train()
+
+        self.assertEqual(mocked_compute_sample_weight.call_count, 3)
+        for call in mocked_compute_sample_weight.call_args_list:
+            self.assertEqual(call.args[0], "balanced")
 
     def test_one_tag_predict(self) -> None:
         t1 = Tag.objects.create(name="t1", matching_algorithm=Tag.MATCH_AUTO, pk=12)
@@ -685,17 +886,6 @@ class TestClassifier(DirectoriesMixin, TestCase):
         self.assertIsNone(load_classifier())
         self.assertTrue(Path(settings.MODEL_FILE).exists())
 
-    def test_load_old_classifier_version(self) -> None:
-        shutil.copy(
-            Path(__file__).parent / "data" / "v1.17.4.model.pickle",
-            self.dirs.scratch_dir,
-        )
-        with override_settings(
-            MODEL_FILE=self.dirs.scratch_dir / "v1.17.4.model.pickle",
-        ):
-            classifier = load_classifier()
-            self.assertIsNone(classifier)
-
     @mock.patch("documents.classifier.DocumentClassifier.load")
     def test_load_classifier_raise_exception(self, mock_load) -> None:
         Path(settings.MODEL_FILE).touch()
@@ -717,6 +907,52 @@ class TestClassifier(DirectoriesMixin, TestCase):
         mock_load.side_effect = Exception()
         with self.assertRaises(Exception):
             load_classifier(raise_exception=True)
+
+
+class _StubProbaClassifier:
+    """
+    A fake scikit-learn classifier exposing just enough of the API for
+    `_predict_with_threshold`: `classes_` and `predict_proba`.
+    """
+
+    def __init__(self, classes: list[int], probabilities: list[float]) -> None:
+        self.classes_ = np.array(classes)
+        self._probabilities = np.array([probabilities])
+
+    def predict_proba(self, X) -> np.ndarray:
+        return self._probabilities
+
+
+@pytest.mark.parametrize(
+    ("classes", "probabilities", "threshold", "expected"),
+    [
+        # confident prediction above the threshold is returned
+        ([-1, 3], [0.1, 0.9], 0.6, 3),
+        # prediction below the threshold is discarded
+        ([-1, 3], [0.45, 0.55], 0.6, None),
+        # boundary: exactly at the threshold is accepted, not discarded
+        ([-1, 3], [0.4, 0.6], 0.6, 3),
+        # the winning class is the "no match" pseudo-class, regardless of its
+        # own confidence
+        ([-1, 3], [0.99, 0.01], 0.0, None),
+        # threshold of 0.0 disables the confidence check entirely
+        ([-1, 3], [0.45, 0.55], 0.0, 3),
+    ],
+)
+def test_predict_with_threshold(classes, probabilities, threshold, expected) -> None:
+    classifier = _StubProbaClassifier(classes, probabilities)
+    result = _predict_with_threshold(classifier, X=None, threshold=threshold)
+    assert result == expected
+
+
+def test_classifier_match_threshold_default() -> None:
+    """
+    GIVEN:
+        - No PAPERLESS_CLASSIFIER_MATCH_THRESHOLD environment variable is set
+    THEN:
+        - The classifier match threshold defaults to 0.6
+    """
+    assert settings.CLASSIFIER_MATCH_THRESHOLD == 0.6
 
 
 def test_preprocess_content() -> None:

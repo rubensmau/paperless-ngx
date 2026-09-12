@@ -14,10 +14,12 @@ from unittest import mock
 import celery
 from dateutil import parser
 from django.conf import settings
+from django.contrib.auth.models import Group
 from django.contrib.auth.models import Permission
 from django.contrib.auth.models import User
 from django.core import mail
 from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import DataError
 from django.test import override_settings
 from django.utils import timezone
@@ -41,15 +43,19 @@ from documents.models import SavedView
 from documents.models import ShareLink
 from documents.models import StoragePath
 from documents.models import Tag
+from documents.models import UiSettings
 from documents.models import Workflow
 from documents.models import WorkflowAction
 from documents.models import WorkflowTrigger
 from documents.signals.handlers import run_workflows
+from documents.tests.factories import DocumentFactory
+from documents.tests.factories import TagFactory
+from documents.tests.utils import ConsumeTaskMixin
 from documents.tests.utils import DirectoriesMixin
-from documents.tests.utils import DocumentConsumeDelayMixin
+from documents.tests.utils import read_streaming_response
 
 
-class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
+class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
     def setUp(self) -> None:
         super().setUp()
 
@@ -176,7 +182,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         results = response.data["results"]
         self.assertEqual(len(results[0]), 0)
 
-    def test_document_fields_api_version_8_respects_created(self) -> None:
+    def test_document_fields_respects_created(self) -> None:
         Document.objects.create(
             title="legacy",
             checksum="123",
@@ -186,7 +192,6 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         response = self.client.get(
             "/api/documents/?fields=id",
-            headers={"Accept": "application/json; version=8"},
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -196,25 +201,22 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         response = self.client.get(
             "/api/documents/?fields=id,created",
-            headers={"Accept": "application/json; version=8"},
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         results = response.data["results"]
         self.assertIn("id", results[0])
         self.assertIn("created", results[0])
-        self.assertRegex(results[0]["created"], r"^2024-01-15T00:00:00.*$")
+        self.assertEqual(results[0]["created"], "2024-01-15")
 
-    def test_document_legacy_created_format(self) -> None:
+    def test_document_created_format(self) -> None:
         """
         GIVEN:
             - Existing document
         WHEN:
-            - Document is requested with api version ≥ 9
-            - Document is requested with api version < 9
+            - Document is requested
         THEN:
             - Document created field is returned as date
-            - Document created field is returned as datetime
         """
         doc = Document.objects.create(
             title="none",
@@ -225,14 +227,6 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         response = self.client.get(
             f"/api/documents/{doc.pk}/",
-            headers={"Accept": "application/json; version=8"},
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertRegex(response.data["created"], r"^2023-01-01T00:00:00.*$")
-
-        response = self.client.get(
-            f"/api/documents/{doc.pk}/",
-            headers={"Accept": "application/json; version=9"},
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["created"], "2023-01-01")
@@ -333,19 +327,16 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             f.write(content_thumbnail)
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_thumbnail)
+        self.assertEqual(read_streaming_response(response), content_thumbnail)
 
     def test_document_actions_with_perms(self) -> None:
         """
@@ -396,12 +387,15 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
         response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
     @override_settings(FILENAME_FORMAT="")
     def test_download_with_archive(self) -> None:
@@ -422,28 +416,136 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             f.write(content_archive)
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_archive)
+        self.assertEqual(read_streaming_response(response), content_archive)
+
+        response = self.client.get(
+            f"/api/documents/{doc.pk}/download/?original=true",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(response), content)
+
+        response = self.client.get(f"/api/documents/{doc.pk}/preview/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(response), content_archive)
+
+        response = self.client.get(
+            f"/api/documents/{doc.pk}/preview/?original=true",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(response), content)
+
+    @override_settings(FILENAME_FORMAT="")
+    def test_download_follow_formatting(self) -> None:
+        content = b"This is a test"
+        content_archive = b"This is the same test but archived"
+
+        doc = Document.objects.create(
+            title="none",
+            filename="my_document.pdf",
+            archive_filename="archived.pdf",
+            mime_type="application/pdf",
+        )
+
+        with Path(doc.source_path).open("wb") as f:
+            f.write(content)
+
+        with Path(doc.archive_path).open("wb") as f:
+            f.write(content_archive)
+
+        # Without follow_formatting, should use public filename
+        response = self.client.get(f"/api/documents/{doc.pk}/download/")
+        self.assertIn("none.pdf", response["Content-Disposition"])
+        response.close()
+
+        # With follow_formatting, should use actual filename on disk
+        response = self.client.get(
+            f"/api/documents/{doc.pk}/download/?follow_formatting=true",
+        )
+        self.assertIn("archived.pdf", response["Content-Disposition"])
+        response.close()
+
+        # With follow_formatting and original, should use source filename
+        response = self.client.get(
+            f"/api/documents/{doc.pk}/download/?original=true&follow_formatting=true",
+        )
+        self.assertIn("my_document.pdf", response["Content-Disposition"])
+        response.close()
+
+    @override_settings(FILENAME_FORMAT="")
+    def test_download_filename_normalization_does_not_inject_parameters(
+        self,
+    ) -> None:
+        doc = Document.objects.create(
+            title="file.doc\uff02; x=\uff02\uff3c",
+            created=date(2020, 1, 2),
+            filename="source.pdf",
+            mime_type="application/pdf",
+        )
+        Path(doc.source_path).write_bytes(b"This is a test")
 
         response = self.client.get(
             f"/api/documents/{doc.pk}/download/?original=true",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(
+            response["Content-Disposition"],
+            "attachment; "
+            'filename="2020-01-02 file.doc_; x=__.pdf"; '
+            "filename*=utf-8''2020-01-02%20file.doc%EF%BC%82%3B%20x%3D%EF%BC%82%EF%BC%BC.pdf",
+        )
+        response.close()
+
+    @override_settings(FILENAME_FORMAT="")
+    def test_serve_text_file_declares_utf8_charset(self) -> None:
+        """
+        GIVEN:
+            - A UTF-8 encoded text document
+        WHEN:
+            - The file is served for preview or download
+        THEN:
+            - The Content-Type declares the UTF-8 charset, so the browser does
+              not fall back to its locale default and mangle non-ASCII text
+        """
+        doc = Document.objects.create(
+            title="none",
+            filename="my_document.txt",
+            mime_type="text/plain",
+        )
+        Path(doc.source_path).write_bytes("für Grüße München".encode())
+
+        for endpoint in ("preview", "download"):
+            with self.subTest(endpoint=endpoint):
+                response = self.client.get(f"/api/documents/{doc.pk}/{endpoint}/")
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response["Content-Type"], "text/plain; charset=utf-8")
+                self.assertEqual(
+                    read_streaming_response(response).decode("utf-8"),
+                    "für Grüße München",
+                )
+
+    @override_settings(FILENAME_FORMAT="")
+    def test_serve_pdf_file_has_no_charset(self) -> None:
+        """
+        GIVEN:
+            - A PDF document
+        WHEN:
+            - The file is served for preview
+        THEN:
+            - No charset is added to the binary content type
+        """
+        doc = Document.objects.create(
+            title="none",
+            filename="my_document.pdf",
+            mime_type="application/pdf",
+        )
+        Path(doc.source_path).write_bytes(b"This is a test")
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_archive)
-
-        response = self.client.get(
-            f"/api/documents/{doc.pk}/preview/?original=true",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        response.close()
 
     def test_document_actions_not_existing_file(self) -> None:
         doc = Document.objects.create(
@@ -460,6 +562,42 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_document_actions_trashed_document(self) -> None:
+        """
+        GIVEN:
+            - Document with files exists
+        WHEN:
+            - Document is soft-deleted (moved to trash)
+            - Preview and thumb endpoints are requested
+        THEN:
+            - HTTP 200 OK for both (trashed documents remain previewable)
+        """
+        _, filename = tempfile.mkstemp(dir=self.dirs.originals_dir)
+        content = b"This is a test"
+        content_thumbnail = b"thumbnail content"
+
+        with Path(filename).open("wb") as f:
+            f.write(content)
+
+        doc = Document.objects.create(
+            title="none",
+            filename=Path(filename).name,
+            mime_type="application/pdf",
+        )
+
+        with (self.dirs.thumbnail_dir / f"{doc.pk:07d}.webp").open("wb") as f:
+            f.write(content_thumbnail)
+
+        doc.delete()
+
+        response = self.client.get(f"/api/documents/{doc.pk}/preview/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(response), content)
+
+        response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(response), content_thumbnail)
 
     def test_document_history_action(self) -> None:
         """
@@ -553,6 +691,36 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         )
         self.assertIsNone(response.data[1]["actor"])
         self.assertEqual(response.data[1]["action"], "create")
+
+    def test_document_history_logs_version_deletion(self) -> None:
+        root_doc = Document.objects.create(
+            title="Root",
+            checksum="123",
+            mime_type="application/pdf",
+            owner=self.user,
+        )
+        version_doc = Document.objects.create(
+            title="Version",
+            checksum="456",
+            mime_type="application/pdf",
+            root_document=root_doc,
+            owner=self.user,
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{root_doc.pk}/versions/{version_doc.pk}/",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.get(f"/api/documents/{root_doc.pk}/history/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data[0]["actor"]["id"], self.user.id)
+        self.assertEqual(response.data[0]["action"], "update")
+        self.assertEqual(
+            response.data[0]["changes"],
+            {"Version Deleted": ["None", version_doc.pk]},
+        )
 
     @override_settings(AUDIT_LOG_ENABLED=False)
     def test_document_history_action_disabled(self) -> None:
@@ -792,6 +960,184 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         results = response.data["results"]
         self.assertEqual(len(results), 3)
+
+    def test_is_in_inbox_filter_no_duplicates_with_multiple_inbox_tags(self) -> None:
+        """
+        GIVEN:
+            - A document tagged with two different inbox tags
+        WHEN:
+            - The document list is filtered by is_in_inbox=true
+        THEN:
+            - The document appears exactly once, not once per matching tag
+        """
+        doc = Document.objects.create(title="doc", checksum="c1")
+        inbox_1 = Tag.objects.create(name="inbox1", is_inbox_tag=True)
+        inbox_2 = Tag.objects.create(name="inbox2", is_inbox_tag=True)
+        doc.tags.add(inbox_1, inbox_2)
+
+        response = self.client.get("/api/documents/?is_in_inbox=true")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], doc.id)
+
+    def test_has_duplicates_filter(self) -> None:
+        original_match = Document.objects.create(
+            title="original match",
+            checksum="same-original",
+        )
+        second_original_match = Document.objects.create(
+            title="second original match",
+            checksum="same-original",
+        )
+        archive_match = Document.objects.create(
+            title="archive match",
+            checksum="archive-source",
+            archive_checksum="same-archive",
+        )
+        original_to_archive_match = Document.objects.create(
+            title="original to archive match",
+            checksum="same-archive",
+        )
+        first_archive_match = Document.objects.create(
+            title="first archive match",
+            checksum="first-archive-source",
+            archive_checksum="same-archive-only",
+        )
+        second_archive_match = Document.objects.create(
+            title="second archive match",
+            checksum="second-archive-source",
+            archive_checksum="same-archive-only",
+        )
+        first_empty_archive = Document.objects.create(
+            title="first empty archive",
+            checksum="first-empty-archive",
+            archive_checksum="",
+        )
+        second_empty_archive = Document.objects.create(
+            title="second empty archive",
+            checksum="second-empty-archive",
+            archive_checksum="",
+        )
+        unique = Document.objects.create(title="unique", checksum="unique")
+        version_root = Document.objects.create(
+            title="version root",
+            checksum="version-root",
+        )
+        Document.objects.create(
+            title="version",
+            checksum=unique.checksum,
+            root_document=version_root,
+            version_index=1,
+        )
+        trash_match = Document.objects.create(
+            title="trash match",
+            checksum="trash-match",
+        )
+        trashed_duplicate = Document.objects.create(
+            title="trashed duplicate",
+            checksum="trash-match",
+        )
+        trashed_duplicate.delete()
+
+        response = self.client.get("/api/documents/?has_duplicates=true")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertCountEqual(
+            [document["id"] for document in response.data["results"]],
+            [
+                original_match.id,
+                second_original_match.id,
+                archive_match.id,
+                original_to_archive_match.id,
+                first_archive_match.id,
+                second_archive_match.id,
+                trash_match.id,
+            ],
+        )
+
+        response = self.client.get("/api/documents/?has_duplicates=false")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertCountEqual(
+            [document["id"] for document in response.data["results"]],
+            [
+                unique.id,
+                version_root.id,
+                first_empty_archive.id,
+                second_empty_archive.id,
+            ],
+        )
+
+        response = self.client.get(f"/api/documents/{first_empty_archive.id}/")
+        self.assertEqual(response.data["duplicate_documents"], [])
+
+    def test_has_duplicates_filter_respects_document_permissions(self) -> None:
+        owner = User.objects.create_user(username="duplicate-owner")
+        requester = User.objects.create_user(username="duplicate-requester")
+        requester.user_permissions.add(
+            Permission.objects.get(codename="view_document"),
+        )
+        visible_document = Document.objects.create(
+            title="visible document",
+            checksum="permission-match",
+            owner=requester,
+        )
+        hidden_duplicate = Document.objects.create(
+            title="hidden duplicate",
+            checksum="permission-match",
+            owner=owner,
+        )
+        self.client.force_authenticate(user=requester)
+
+        response = self.client.get("/api/documents/?has_duplicates=true")
+        self.assertNotIn(
+            visible_document.id,
+            [document["id"] for document in response.data["results"]],
+        )
+
+        assign_perm("view_document", requester, hidden_duplicate)
+        response = self.client.get("/api/documents/?has_duplicates=true")
+        self.assertIn(
+            visible_document.id,
+            [document["id"] for document in response.data["results"]],
+        )
+
+    def test_custom_fields_icontains_filter_no_duplicates(self) -> None:
+        """
+        GIVEN:
+            - A document with two custom field instances that both match the
+              same custom_fields__icontains search term
+        WHEN:
+            - The document list is filtered by custom_fields__icontains
+        THEN:
+            - The document appears exactly once, not once per matching field
+        """
+        doc = Document.objects.create(title="doc", checksum="c1")
+        field_1 = CustomField.objects.create(
+            name="apple",
+            data_type=CustomField.FieldDataType.STRING,
+        )
+        field_2 = CustomField.objects.create(
+            name="apricot",
+            data_type=CustomField.FieldDataType.STRING,
+        )
+        CustomFieldInstance.objects.create(
+            document=doc,
+            field=field_1,
+            value_text="something",
+        )
+        CustomFieldInstance.objects.create(
+            document=doc,
+            field=field_2,
+            value_text="something else",
+        )
+
+        response = self.client.get("/api/documents/?custom_fields__icontains=ap")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], doc.id)
 
     def test_custom_field_select_filter(self) -> None:
         """
@@ -1066,21 +1412,104 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             [u1_doc1.id],
         )
 
-    def test_pagination_all(self) -> None:
+    def test_document_owned_and_group_shared_not_duplicated_when_filtering_by_tags(
+        self,
+    ) -> None:
+        """
+        GIVEN:
+            - A document owned by a user and also shared with a group the user belongs to
+        WHEN:
+            - The user filters documents by more than one tag (tags__id__all)
+        THEN:
+            - The document is returned exactly once, not once per permission path
+            (regression test for https://github.com/paperless-ngx/paperless-ngx/issues/13331)
+        """
+        user = User.objects.create_user("user1")
+        user.user_permissions.add(*Permission.objects.filter(codename="view_document"))
+        group = Group.objects.create(name="group1")
+        user.groups.add(group)
+
+        tag1 = TagFactory()
+        tag2 = TagFactory()
+        doc = DocumentFactory(title="shared", owner=user)
+        doc.tags.add(tag1, tag2)
+        assign_perm("view_document", group, doc)
+
+        self.client.force_authenticate(user=user)
+        response = self.client.get(
+            f"/api/documents/?tags__id__all={tag1.id},{tag2.id}",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], doc.id)
+
+    def test_document_permission_filter_excludes_unrelated_documents(self) -> None:
+        """
+        GIVEN:
+            - A document owned by one user, with no permission granted to another user
+        WHEN:
+            - The unrelated user requests the document list
+        THEN:
+            - The document does not appear in their results
+        """
+        owner = User.objects.create_user("owner1")
+        stranger = User.objects.create_user("stranger1")
+        stranger.user_permissions.add(
+            *Permission.objects.filter(codename="view_document"),
+        )
+
+        DocumentFactory(title="private", owner=owner)
+
+        self.client.force_authenticate(user=stranger)
+        response = self.client.get("/api/documents/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+
+    def test_document_permission_filter_only_visible_to_group_members(self) -> None:
+        """
+        GIVEN:
+            - A document shared with a group via object permissions
+        WHEN:
+            - A group member and a non-member both request the document list
+        THEN:
+            - Only the group member sees the document
+        """
+        owner = User.objects.create_user("owner2")
+        member = User.objects.create_user("member1")
+        non_member = User.objects.create_user("nonmember1")
+        for u in (member, non_member):
+            u.user_permissions.add(*Permission.objects.filter(codename="view_document"))
+
+        group = Group.objects.create(name="group2")
+        member.groups.add(group)
+
+        doc = DocumentFactory(title="shared2", owner=owner)
+        assign_perm("view_document", group, doc)
+
+        self.client.force_authenticate(user=member)
+        response = self.client.get("/api/documents/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], doc.id)
+
+        self.client.force_authenticate(user=non_member)
+        response = self.client.get("/api/documents/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+
+    def test_pagination_results(self) -> None:
         """
         GIVEN:
             - A set of 50 documents
         WHEN:
             - API request for document filtering
         THEN:
-            - Results are paginated (25 items) and response["all"] returns all ids (50 items)
+            - Results are paginated (25 items) and count reflects all results (50 items)
         """
         t = Tag.objects.create(name="tag")
-        docs = []
         for i in range(50):
             d = Document.objects.create(checksum=i, content=f"test{i}")
             d.tags.add(t)
-            docs.append(d)
 
         response = self.client.get(
             f"/api/documents/?tags__id__in={t.id}",
@@ -1088,8 +1517,177 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         results = response.data["results"]
         self.assertEqual(len(results), 25)
-        self.assertEqual(len(response.data["all"]), 50)
+        self.assertEqual(response.data["count"], 50)
+        self.assertNotIn("all", response.data)
+
+    def test_pagination_all_for_api_version_9(self) -> None:
+        """
+        GIVEN:
+            - A set of documents matching a filter
+        WHEN:
+            - API request uses legacy version 9
+        THEN:
+            - Response includes "all" for backward compatibility
+        """
+        t = Tag.objects.create(name="tag")
+        docs = []
+        for i in range(4):
+            d = Document.objects.create(checksum=i, content=f"test{i}")
+            d.tags.add(t)
+            docs.append(d)
+
+        response = self.client.get(
+            f"/api/documents/?tags__id__in={t.id}",
+            headers={"Accept": "application/json; version=9"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("all", response.data)
         self.assertCountEqual(response.data["all"], [d.id for d in docs])
+
+    def test_default_ordering_uses_id_as_tiebreaker(self) -> None:
+        """
+        GIVEN:
+            - Documents sharing the same created date
+        WHEN:
+            - API request for documents without an explicit ordering
+        THEN:
+            - Results are correctly ordered by created > id
+        """
+        older_doc = Document.objects.create(
+            checksum="older",
+            content="older",
+            created=date(2024, 1, 1),
+        )
+        first_same_date_doc = Document.objects.create(
+            checksum="same-date-1",
+            content="same-date-1",
+            created=date(2024, 1, 2),
+        )
+        second_same_date_doc = Document.objects.create(
+            checksum="same-date-2",
+            content="same-date-2",
+            created=date(2024, 1, 2),
+        )
+
+        response = self.client.get("/api/documents/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [result["id"] for result in response.data["results"]],
+            [
+                second_same_date_doc.id,
+                first_same_date_doc.id,
+                older_doc.id,
+            ],
+        )
+
+    def test_list_with_include_selection_data(self) -> None:
+        correspondent = Correspondent.objects.create(name="c1")
+        doc_type = DocumentType.objects.create(name="dt1")
+        storage_path = StoragePath.objects.create(name="sp1")
+        tag = Tag.objects.create(name="tag")
+
+        matching_doc = Document.objects.create(
+            checksum="A",
+            correspondent=correspondent,
+            document_type=doc_type,
+            storage_path=storage_path,
+        )
+        matching_doc.tags.add(tag)
+
+        non_matching_doc = Document.objects.create(checksum="B")
+        non_matching_doc.tags.add(Tag.objects.create(name="other"))
+
+        response = self.client.get(
+            f"/api/documents/?tags__id__in={tag.id}&include_selection_data=true",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("selection_data", response.data)
+
+        selected_correspondent = next(
+            item
+            for item in response.data["selection_data"]["selected_correspondents"]
+            if item["id"] == correspondent.id
+        )
+        selected_tag = next(
+            item
+            for item in response.data["selection_data"]["selected_tags"]
+            if item["id"] == tag.id
+        )
+        selected_type = next(
+            item
+            for item in response.data["selection_data"]["selected_document_types"]
+            if item["id"] == doc_type.id
+        )
+        selected_storage_path = next(
+            item
+            for item in response.data["selection_data"]["selected_storage_paths"]
+            if item["id"] == storage_path.id
+        )
+
+        self.assertEqual(selected_correspondent["document_count"], 1)
+        self.assertEqual(selected_tag["document_count"], 1)
+        self.assertEqual(selected_type["document_count"], 1)
+        self.assertEqual(selected_storage_path["document_count"], 1)
+
+    def test_selection_data_document_counts_per_tag(self) -> None:
+        """
+        GIVEN:
+            - Multiple tags with different numbers of matching documents
+              within the filtered set, including one with no matches
+        WHEN:
+            - Requesting the document list with include_selection_data=true
+        THEN:
+            - Each tag's document_count reflects only documents in the
+              filtered set, not the instance-wide count
+        """
+        tag_a = Tag.objects.create(name="a")
+        tag_b = Tag.objects.create(name="b")
+        tag_unused = Tag.objects.create(name="unused")
+        custom_field = CustomField.objects.create(
+            name="cf1",
+            data_type=CustomField.FieldDataType.STRING,
+        )
+
+        doc1 = Document.objects.create(checksum="1", correspondent=None)
+        doc1.tags.add(tag_a)
+        doc2 = Document.objects.create(checksum="2")
+        doc2.tags.add(tag_a, tag_b)
+        doc3 = Document.objects.create(checksum="3")
+        doc3.tags.add(tag_b)
+        CustomFieldInstance.objects.create(
+            document=doc1,
+            field=custom_field,
+            value_text="x",
+        )
+
+        # Excluded from the filtered set entirely.
+        excluded = Document.objects.create(checksum="4")
+        excluded.tags.add(tag_a, tag_b, tag_unused)
+
+        response = self.client.get(
+            f"/api/documents/?id__in={doc1.id},{doc2.id},{doc3.id}"
+            "&include_selection_data=true",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        selection_data = response.data["selection_data"]
+
+        counts_by_tag = {
+            item["id"]: item["document_count"]
+            for item in selection_data["selected_tags"]
+        }
+        self.assertEqual(counts_by_tag[tag_a.id], 2)
+        self.assertEqual(counts_by_tag[tag_b.id], 2)
+        self.assertEqual(counts_by_tag[tag_unused.id], 0)
+
+        counts_by_field = {
+            item["id"]: item["document_count"]
+            for item in selection_data["selected_custom_fields"]
+        }
+        self.assertEqual(counts_by_field[custom_field.id], 1)
 
     def test_statistics(self) -> None:
         doc1 = Document.objects.create(
@@ -1141,6 +1739,35 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(response.data["document_type_count"], 1)
         self.assertEqual(response.data["storage_path_count"], 2)
 
+    def test_statistics_excludes_document_versions(self) -> None:
+        root = Document.objects.create(
+            title="root",
+            checksum="A",
+            mime_type="application/pdf",
+            content="root",
+        )
+        version = Document.objects.create(
+            title="version",
+            checksum="B",
+            mime_type="application/pdf",
+            content="version",
+            root_document=root,
+            version_index=1,
+        )
+        tag_inbox = Tag.objects.create(name="t1", is_inbox_tag=True)
+        version.tags.add(tag_inbox)
+
+        response = self.client.get("/api/statistics/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["documents_total"], 1)
+        self.assertEqual(response.data["documents_inbox"], 0)
+        self.assertEqual(response.data["character_count"], 4)
+        self.assertEqual(
+            response.data["document_file_type_counts"][0]["mime_type_count"],
+            1,
+        )
+
     def test_statistics_no_inbox_tag(self) -> None:
         Document.objects.create(title="none1", checksum="A")
 
@@ -1188,6 +1815,41 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["documents_inbox"], 0)
 
+    def test_statistics_with_statistics_permission(self) -> None:
+        owner = User.objects.create_user("owner")
+        stats_user = User.objects.create_user("stats-user")
+        stats_user.user_permissions.add(
+            Permission.objects.get(codename="view_global_statistics"),
+        )
+
+        inbox_tag = Tag.objects.create(
+            name="stats_inbox",
+            is_inbox_tag=True,
+            owner=owner,
+        )
+        Document.objects.create(
+            title="owned-doc",
+            checksum="stats-A",
+            mime_type="application/pdf",
+            content="abcdef",
+            owner=owner,
+        ).tags.add(inbox_tag)
+        Correspondent.objects.create(name="stats-correspondent", owner=owner)
+        DocumentType.objects.create(name="stats-type", owner=owner)
+        StoragePath.objects.create(name="stats-path", path="archive", owner=owner)
+
+        self.client.force_authenticate(user=stats_user)
+        response = self.client.get("/api/statistics/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["documents_total"], 1)
+        self.assertEqual(response.data["documents_inbox"], 1)
+        self.assertEqual(response.data["inbox_tags"], [inbox_tag.pk])
+        self.assertEqual(response.data["character_count"], 6)
+        self.assertEqual(response.data["correspondent_count"], 1)
+        self.assertEqual(response.data["document_type_count"], 1)
+        self.assertEqual(response.data["storage_path_count"], 1)
+
     def test_upload(self) -> None:
         self.consume_file_mock.return_value = celery.result.AsyncResult(
             id=str(uuid.uuid4()),
@@ -1201,16 +1863,119 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
-        self.assertIn(Path(settings.SCRATCH_DIR), input_doc.original_file.parents)
+        self.assertTrue(
+            input_doc.original_file.resolve(strict=False).is_relative_to(
+                Path(settings.SCRATCH_DIR).resolve(strict=False),
+            ),
+        )
         self.assertIsNone(overrides.title)
         self.assertIsNone(overrides.correspondent_id)
         self.assertIsNone(overrides.document_type_id)
         self.assertIsNone(overrides.tag_ids)
+
+    def test_upload_with_path_traversal_filename_is_reduced_to_basename(self) -> None:
+        self.consume_file_mock.return_value = celery.result.AsyncResult(
+            id=str(uuid.uuid4()),
+        )
+
+        payload = SimpleUploadedFile(
+            "../../outside.pdf",
+            (Path(__file__).parent / "samples" / "simple.pdf").read_bytes(),
+            content_type="application/pdf",
+        )
+
+        response = self.client.post(
+            "/api/documents/post_document/",
+            {"document": payload},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
+
+        self.assertEqual(input_doc.original_file.name, "outside.pdf")
+        self.assertEqual(overrides.filename, "outside.pdf")
+        self.assertNotIn("..", input_doc.original_file.name)
+        self.assertNotIn("..", overrides.filename)
+        self.assertTrue(
+            input_doc.original_file.resolve(strict=False).is_relative_to(
+                Path(settings.SCRATCH_DIR).resolve(strict=False),
+            ),
+        )
+
+    def test_upload_with_path_traversal_content_disposition_filename_is_reduced_to_basename(
+        self,
+    ) -> None:
+        self.consume_file_mock.return_value = celery.result.AsyncResult(
+            id=str(uuid.uuid4()),
+        )
+
+        pdf_bytes = (Path(__file__).parent / "samples" / "simple.pdf").read_bytes()
+        boundary = "paperless-boundary"
+        payload = (
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="document"; '
+                'filename="../../outside.pdf"\r\n'
+                "Content-Type: application/pdf\r\n\r\n"
+            ).encode()
+            + pdf_bytes
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+
+        response = self.client.generic(
+            "POST",
+            "/api/documents/post_document/",
+            payload,
+            content_type=f"multipart/form-data; boundary={boundary}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
+
+        self.assertEqual(input_doc.original_file.name, "outside.pdf")
+        self.assertEqual(overrides.filename, "outside.pdf")
+        self.assertNotIn("..", input_doc.original_file.name)
+        self.assertNotIn("..", overrides.filename)
+        self.assertTrue(
+            input_doc.original_file.resolve(strict=False).is_relative_to(
+                Path(settings.SCRATCH_DIR).resolve(strict=False),
+            ),
+        )
+
+    def test_document_filters_use_latest_version_content(self) -> None:
+        root = Document.objects.create(
+            title="versioned root",
+            checksum="root",
+            mime_type="application/pdf",
+            content="root-content",
+        )
+        version = Document.objects.create(
+            title="versioned root",
+            checksum="v1",
+            mime_type="application/pdf",
+            root_document=root,
+            content="latest-version-content",
+        )
+
+        response = self.client.get(
+            "/api/documents/?content__icontains=latest-version-content",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], root.id)
+        self.assertEqual(results[0]["content"], version.content)
+
+        response = self.client.get(
+            "/api/documents/?title_content=latest-version-content",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], root.id)
 
     def test_create_wrong_endpoint(self) -> None:
         response = self.client.post(
@@ -1250,12 +2015,14 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
-        self.assertIn(Path(settings.SCRATCH_DIR), input_doc.original_file.parents)
+        self.assertTrue(
+            input_doc.original_file.resolve(strict=False).is_relative_to(
+                Path(settings.SCRATCH_DIR).resolve(strict=False),
+            ),
+        )
         self.assertIsNone(overrides.title)
         self.assertIsNone(overrides.correspondent_id)
         self.assertIsNone(overrides.document_type_id)
@@ -1300,9 +2067,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.title, "my custom title")
         self.assertIsNone(overrides.correspondent_id)
@@ -1322,9 +2087,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.correspondent_id, c.id)
         self.assertIsNone(overrides.title)
@@ -1358,9 +2121,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.document_type_id, dt.id)
         self.assertIsNone(overrides.correspondent_id)
@@ -1394,9 +2155,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.storage_path_id, sp.id)
         self.assertIsNone(overrides.correspondent_id)
@@ -1431,9 +2190,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertCountEqual(overrides.tag_ids, [t1.id, t2.id])
         self.assertIsNone(overrides.document_type_id)
@@ -1478,9 +2235,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.created, created.date())
 
@@ -1497,9 +2252,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -1529,9 +2282,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -1586,9 +2337,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         new_overrides, _ = run_workflows(
             trigger_type=WorkflowTrigger.WorkflowTriggerType.CONSUMPTION,
@@ -1634,9 +2383,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -1735,9 +2482,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, _ = self.get_last_consume_delay_call_args()
+        input_doc, _ = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.source, WorkflowTrigger.DocumentSourceChoices.WEB_UI)
 
@@ -1863,6 +2608,29 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         response = self.client.get("/api/documents/34676/suggestions/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    @mock.patch("documents.views.get_ai_document_classification")
+    @override_settings(AI_ENABLED=True)
+    def test_suggestions_still_uses_classifier_when_ai_enabled(
+        self,
+        mock_get_ai_classification,
+    ) -> None:
+        doc = Document.objects.create(title="test", mime_type="application/pdf")
+
+        response = self.client.get(f"/api/documents/{doc.pk}/suggestions/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data,
+            {
+                "correspondents": [],
+                "tags": [],
+                "document_types": [],
+                "storage_paths": [],
+                "dates": [],
+            },
+        )
+        mock_get_ai_classification.assert_not_called()
+
     @mock.patch("documents.views.match_storage_paths")
     @mock.patch("documents.views.match_document_types")
     @mock.patch("documents.views.match_tags")
@@ -1874,7 +2642,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         match_tags,
         match_document_types,
         match_storage_paths,
-    ):
+    ) -> None:
         doc = Document.objects.create(
             title="test",
             mime_type="application/pdf",
@@ -1911,7 +2679,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         match_document_types,
         match_storage_paths,
         mocked_load,
-    ):
+    ) -> None:
         """
         GIVEN:
            - Request for suggestions for a document
@@ -1994,7 +2762,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
     def test_get_suggestions_dates_disabled(
         self,
         mock_get_date_parser: mock.MagicMock,
-    ):
+    ) -> None:
         """
         GIVEN:
             - NUMBER_OF_SUGGESTED_DATES = 0 (disables feature)
@@ -2014,69 +2782,292 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         mock_get_date_parser.assert_not_called()
 
     def test_saved_views(self) -> None:
-        u1 = User.objects.create_superuser("user1")
-        u2 = User.objects.create_superuser("user2")
+        u1 = User.objects.create_user("user1")
+        u2 = User.objects.create_user("user2")
+        u3 = User.objects.create_user("user3")
+
+        view_perm = Permission.objects.get(codename="view_savedview")
+        change_perm = Permission.objects.get(codename="change_savedview")
+        for user in [u1, u2, u3]:
+            user.user_permissions.add(view_perm, change_perm)
 
         v1 = SavedView.objects.create(
             owner=u1,
             name="test1",
             sort_field="",
-            show_on_dashboard=False,
-            show_in_sidebar=False,
         )
-        SavedView.objects.create(
+        v2 = SavedView.objects.create(
             owner=u2,
             name="test2",
             sort_field="",
-            show_on_dashboard=False,
-            show_in_sidebar=False,
         )
-        SavedView.objects.create(
+        v3 = SavedView.objects.create(
             owner=u2,
             name="test3",
             sort_field="",
-            show_on_dashboard=False,
-            show_in_sidebar=False,
         )
 
-        response = self.client.get("/api/saved_views/")
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 0)
-
-        self.assertEqual(
-            self.client.get(f"/api/saved_views/{v1.id}/").status_code,
-            status.HTTP_404_NOT_FOUND,
-        )
+        assign_perm("view_savedview", u1, v2)
+        assign_perm("change_savedview", u1, v2)
+        assign_perm("view_savedview", u1, v3)
 
         self.client.force_authenticate(user=u1)
 
         response = self.client.get("/api/saved_views/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["count"], 3)
 
+        for view_id in [v1.id, v2.id, v3.id]:
+            self.assertEqual(
+                self.client.get(f"/api/saved_views/{view_id}/").status_code,
+                status.HTTP_200_OK,
+            )
+
+        response = self.client.patch(
+            f"/api/saved_views/{v2.id}/",
+            {"sort_field": "added"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.patch(
+            f"/api/saved_views/{v3.id}/",
+            {"sort_field": "added"},
+            format="json",
+        )
         self.assertEqual(
-            self.client.get(f"/api/saved_views/{v1.id}/").status_code,
-            status.HTTP_200_OK,
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
         )
 
-        self.client.force_authenticate(user=u2)
+        response = self.client.patch(
+            f"/api/saved_views/{v2.id}/",
+            {
+                "set_permissions": {
+                    "view": {"users": [u3.id]},
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        response = self.client.patch(
+            f"/api/saved_views/{v2.id}/",
+            {"owner": u1.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=u3)
 
         response = self.client.get("/api/saved_views/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["count"], 0)
 
-        self.assertEqual(
-            self.client.get(f"/api/saved_views/{v1.id}/").status_code,
-            status.HTTP_404_NOT_FOUND,
+    def test_saved_view_api_version_backward_compatibility(self) -> None:
+        """
+        GIVEN:
+            - Saved views and UiSettings with visibility preferences
+        WHEN:
+            - API request with version=9 (legacy)
+            - API request with version=10 (current)
+        THEN:
+            - Version 9 returns show_on_dashboard and show_in_sidebar from UiSettings
+            - Version 10 omits these fields (moved to UiSettings)
+        """
+        v1 = SavedView.objects.create(
+            owner=self.user,
+            name="dashboard_view",
+            sort_field="created",
         )
+        v2 = SavedView.objects.create(
+            owner=self.user,
+            name="sidebar_view",
+            sort_field="created",
+        )
+        v3 = SavedView.objects.create(
+            owner=self.user,
+            name="hidden_view",
+            sort_field="created",
+        )
+
+        UiSettings.objects.update_or_create(
+            user=self.user,
+            defaults={
+                "settings": {
+                    "saved_views": {
+                        "dashboard_views_visible_ids": [v1.id],
+                        "sidebar_views_visible_ids": [v2.id],
+                    },
+                },
+            },
+        )
+
+        response_v9 = self.client.get(
+            "/api/saved_views/",
+            headers={"Accept": "application/json; version=9"},
+            format="json",
+        )
+        self.assertEqual(response_v9.status_code, status.HTTP_200_OK)
+        results_v9 = {r["id"]: r for r in response_v9.data["results"]}
+        self.assertIn("show_on_dashboard", results_v9[v1.id])
+        self.assertIn("show_in_sidebar", results_v9[v1.id])
+        self.assertTrue(results_v9[v1.id]["show_on_dashboard"])
+        self.assertFalse(results_v9[v1.id]["show_in_sidebar"])
+        self.assertTrue(results_v9[v2.id]["show_in_sidebar"])
+        self.assertFalse(results_v9[v2.id]["show_on_dashboard"])
+        self.assertFalse(results_v9[v3.id]["show_on_dashboard"])
+        self.assertFalse(results_v9[v3.id]["show_in_sidebar"])
+
+        response_v10 = self.client.get(
+            "/api/saved_views/",
+            headers={"Accept": "application/json; version=10"},
+            format="json",
+        )
+        self.assertEqual(response_v10.status_code, status.HTTP_200_OK)
+        results_v10 = {r["id"]: r for r in response_v10.data["results"]}
+        self.assertNotIn("show_on_dashboard", results_v10[v1.id])
+        self.assertNotIn("show_in_sidebar", results_v10[v1.id])
+
+    def test_saved_view_api_version_9_user_without_ui_settings(self) -> None:
+        """
+        GIVEN:
+            - User with no UiSettings and a saved view
+        WHEN:
+            - API request with version=9
+        THEN:
+            - show_on_dashboard and show_in_sidebar are False (default)
+        """
+        SavedView.objects.create(
+            owner=self.user,
+            name="test_view",
+            sort_field="created",
+        )
+        UiSettings.objects.filter(user=self.user).delete()
+
+        response = self.client.get(
+            "/api/saved_views/",
+            headers={"Accept": "application/json; version=9"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result = response.data["results"][0]
+        self.assertFalse(result["show_on_dashboard"])
+        self.assertFalse(result["show_in_sidebar"])
+
+    def test_saved_view_api_version_9_create_writes_visibility_to_ui_settings(
+        self,
+    ) -> None:
+        """
+        GIVEN:
+            - No UiSettings for the current user
+        WHEN:
+            - A saved view is created through API version 9 with visibility flags
+        THEN:
+            - Visibility is persisted in UiSettings.saved_views
+        """
+        UiSettings.objects.filter(user=self.user).delete()
+
+        response = self.client.post(
+            "/api/saved_views/",
+            {
+                "name": "legacy-v9-create",
+                "sort_field": "created",
+                "filter_rules": [],
+                "show_on_dashboard": True,
+                "show_in_sidebar": False,
+            },
+            headers={"Accept": "application/json; version=9"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.data["show_on_dashboard"])
+        self.assertFalse(response.data["show_in_sidebar"])
+
+        self.user.refresh_from_db()
+        self.assertTrue(hasattr(self.user, "ui_settings"))
+        saved_view_settings = self.user.ui_settings.settings["saved_views"]
+        self.assertListEqual(
+            saved_view_settings["dashboard_views_visible_ids"],
+            [response.data["id"]],
+        )
+        self.assertListEqual(saved_view_settings["sidebar_views_visible_ids"], [])
+
+    def test_saved_view_api_version_9_patch_writes_visibility_to_ui_settings(
+        self,
+    ) -> None:
+        """
+        GIVEN:
+            - Existing saved views and UiSettings visibility ids
+        WHEN:
+            - A saved view is updated through API version 9 visibility flags
+        THEN:
+            - The per-user UiSettings visibility ids are updated
+        """
+        v1 = SavedView.objects.create(
+            owner=self.user,
+            name="legacy-v9-patch-1",
+            sort_field="created",
+        )
+        v2 = SavedView.objects.create(
+            owner=self.user,
+            name="legacy-v9-patch-2",
+            sort_field="created",
+        )
+        UiSettings.objects.update_or_create(
+            user=self.user,
+            defaults={
+                "settings": {
+                    "saved_views": {
+                        "dashboard_views_visible_ids": [v1.id],
+                        "sidebar_views_visible_ids": [v1.id, v2.id],
+                    },
+                },
+            },
+        )
+
+        response = self.client.patch(
+            f"/api/saved_views/{v1.id}/",
+            {
+                "show_on_dashboard": False,
+            },
+            headers={"Accept": "application/json; version=9"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["show_on_dashboard"])
+        self.assertTrue(response.data["show_in_sidebar"])
+
+        self.user.refresh_from_db()
+        saved_view_settings = self.user.ui_settings.settings["saved_views"]
+        self.assertListEqual(saved_view_settings["dashboard_views_visible_ids"], [])
+        self.assertListEqual(
+            saved_view_settings["sidebar_views_visible_ids"],
+            [v1.id, v2.id],
+        )
+
+        response = self.client.patch(
+            f"/api/saved_views/{v1.id}/",
+            {
+                "show_in_sidebar": False,
+            },
+            headers={"Accept": "application/json; version=9"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["show_on_dashboard"])
+        self.assertFalse(response.data["show_in_sidebar"])
+
+        self.user.refresh_from_db()
+        saved_view_settings = self.user.ui_settings.settings["saved_views"]
+        self.assertListEqual(saved_view_settings["dashboard_views_visible_ids"], [])
+        self.assertListEqual(saved_view_settings["sidebar_views_visible_ids"], [v2.id])
 
     def test_saved_view_create_update_patch(self) -> None:
         User.objects.create_user("user1")
 
         view = {
             "name": "test",
-            "show_on_dashboard": True,
-            "show_in_sidebar": True,
             "sort_field": "created2",
             "filter_rules": [{"rule_type": 4, "value": "test"}],
         }
@@ -2086,18 +3077,20 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         v1 = SavedView.objects.get(name="test")
         self.assertEqual(v1.sort_field, "created2")
+        self.assertEqual(v1.icon, SavedView.Icon.FUNNEL)
         self.assertEqual(v1.filter_rules.count(), 1)
         self.assertEqual(v1.owner, self.user)
 
         response = self.client.patch(
             f"/api/saved_views/{v1.id}/",
-            {"show_in_sidebar": False},
+            {"sort_reverse": True, "icon": SavedView.Icon.RECEIPT},
             format="json",
         )
 
         v1 = SavedView.objects.get(id=v1.id)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertFalse(v1.show_in_sidebar)
+        self.assertTrue(v1.sort_reverse)
+        self.assertEqual(v1.icon, SavedView.Icon.RECEIPT)
         self.assertEqual(v1.filter_rules.count(), 1)
 
         view["filter_rules"] = [{"rule_type": 12, "value": "secret"}]
@@ -2117,6 +3110,13 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         v1 = SavedView.objects.get(id=v1.id)
         self.assertEqual(v1.filter_rules.count(), 0)
 
+        response = self.client.patch(
+            f"/api/saved_views/{v1.id}/",
+            {"icon": "not-an-icon"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
     def test_saved_view_display_options(self) -> None:
         """
         GIVEN:
@@ -2131,8 +3131,6 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         view = {
             "name": "test",
-            "show_on_dashboard": True,
-            "show_in_sidebar": True,
             "sort_field": "created2",
             "filter_rules": [{"rule_type": 4, "value": "test"}],
             "page_size": 20,
@@ -2220,8 +3218,6 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         """
         view = {
             "name": "test",
-            "show_on_dashboard": True,
-            "show_in_sidebar": True,
             "sort_field": "created2",
             "filter_rules": [{"rule_type": 4, "value": "test"}],
             "page_size": 20,
@@ -2297,8 +3293,6 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             owner=self.user,
             name="test",
             sort_field=SavedView.DisplayFields.CUSTOM_FIELD % custom_field.id,
-            show_on_dashboard=True,
-            show_in_sidebar=True,
             display_fields=[
                 SavedView.DisplayFields.TITLE,
                 SavedView.DisplayFields.CREATED,
@@ -2419,57 +3413,6 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
             self.assertEqual(response.status_code, status.HTTP_201_CREATED, endpoint)
 
-    def test_tag_color_default(self) -> None:
-        response = self.client.post("/api/tags/", {"name": "tag"}, format="json")
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(Tag.objects.get(id=response.data["id"]).color, "#a6cee3")
-        self.assertEqual(
-            self.client.get(
-                f"/api/tags/{response.data['id']}/",
-                headers={"Accept": "application/json; version=1"},
-                format="json",
-            ).data["colour"],
-            1,
-        )
-
-    def test_tag_color(self) -> None:
-        response = self.client.post(
-            "/api/tags/",
-            data={"name": "tag", "colour": 3},
-            headers={"Accept": "application/json; version=1"},
-            format="json",
-        )
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(Tag.objects.get(id=response.data["id"]).color, "#b2df8a")
-        self.assertEqual(
-            self.client.get(
-                f"/api/tags/{response.data['id']}/",
-                headers={"Accept": "application/json; version=1"},
-                format="json",
-            ).data["colour"],
-            3,
-        )
-
-    def test_tag_color_invalid(self) -> None:
-        response = self.client.post(
-            "/api/tags/",
-            data={"name": "tag", "colour": 34},
-            headers={"Accept": "application/json; version=1"},
-            format="json",
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_tag_color_custom(self) -> None:
-        tag = Tag.objects.create(name="test", color="#abcdef")
-        self.assertEqual(
-            self.client.get(
-                f"/api/tags/{tag.id}/",
-                headers={"Accept": "application/json; version=1"},
-                format="json",
-            ).data["colour"],
-            1,
-        )
-
     def test_get_existing_notes(self) -> None:
         """
         GIVEN:
@@ -2532,26 +3475,6 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             },
         )
 
-    def test_docnote_serializer_v7(self) -> None:
-        doc = Document.objects.create(
-            title="test",
-            mime_type="application/pdf",
-            content="this is a document which will have notes!",
-        )
-        Note.objects.create(
-            note="This is a note.",
-            document=doc,
-            user=self.user,
-        )
-        self.assertEqual(
-            self.client.get(
-                f"/api/documents/{doc.pk}/",
-                headers={"Accept": "application/json; version=7"},
-                format="json",
-            ).data["notes"][0]["user"],
-            self.user.id,
-        )
-
     def test_create_note(self) -> None:
         """
         GIVEN:
@@ -2595,6 +3518,46 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         doc = Document.objects.get(pk=doc.pk)
         # modified was updated to today
         self.assertEqual(doc.modified.day, timezone.now().day)
+
+    def test_create_note_only_saves_document_modified_field(self) -> None:
+        """
+        GIVEN:
+            - Existing document with a created date
+        WHEN:
+            - API request is made to add a note
+        THEN:
+            - Only the document modified field is persisted by the note endpoint
+            - Other document fields are not rewritten by the note endpoint
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document which will have notes added",
+            created=datetime.date(2026, 3, 31),
+        )
+        original_save = Document.save
+
+        with mock.patch.object(
+            Document,
+            "save",
+            autospec=True,
+            side_effect=original_save,
+        ) as save_mock:
+            resp = self.client.post(
+                f"/api/documents/{doc.pk}/notes/",
+                data={"note": "this is a posted note"},
+            )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        doc.refresh_from_db()
+        self.assertEqual(doc.created, datetime.date(2026, 3, 31))
+        self.assertTrue(
+            any(
+                call.kwargs.get("update_fields") == ["modified"]
+                for call in save_mock.call_args_list
+                if call.args and call.args[0].pk == doc.pk
+            ),
+        )
 
     def test_notes_permissions_aware(self) -> None:
         """
@@ -2652,6 +3615,55 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(response.content, b"Insufficient permissions to delete notes")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_notes_require_global_document_permissions(self) -> None:
+        user = User.objects.create_user(username="note_editor")
+        user.user_permissions.add(
+            *Permission.objects.filter(
+                codename__in=["view_note", "add_note", "delete_note"],
+            ),
+        )
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="notes",
+            owner=user,
+        )
+        note = Note.objects.create(note="Existing", document=doc, user=user)
+        self.client.force_authenticate(user)
+
+        response = self.client.get(f"/api/documents/{doc.pk}/notes/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        user.user_permissions.add(
+            Permission.objects.get(codename="view_document"),
+        )
+        user = User.objects.get(pk=user.pk)
+        self.client.force_authenticate(user)
+        response = self.client.get(f"/api/documents/{doc.pk}/notes/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.post(
+            f"/api/documents/{doc.pk}/notes/",
+            data={"note": "New"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        user.user_permissions.add(
+            Permission.objects.get(codename="change_document"),
+        )
+        user = User.objects.get(pk=user.pk)
+        self.client.force_authenticate(user)
+        response = self.client.post(
+            f"/api/documents/{doc.pk}/notes/",
+            data={"note": "New"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id={note.pk}",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
     def test_delete_note(self) -> None:
         """
         GIVEN:
@@ -2687,6 +3699,77 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         doc = Document.objects.get(pk=doc.pk)
         # modified was updated to today
         self.assertEqual(doc.modified.day, timezone.now().day)
+
+    def test_delete_note_missing_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document
+        WHEN:
+            - API DELETE request to notes endpoint without an id query param
+            - API DELETE request to notes endpoint with an empty id query param
+        THEN:
+            - HTTP 400 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_note_invalid_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document
+        WHEN:
+            - API DELETE request to notes endpoint with a non-integer note id
+        THEN:
+            - HTTP 400 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=notaninteger",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_note_nonexistent_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document, no notes
+        WHEN:
+            - API DELETE request to notes endpoint with a non-existent note id
+        THEN:
+            - HTTP 404 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=99999",
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_get_notes_no_doc(self) -> None:
         """
@@ -2909,6 +3992,69 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             format="json",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_create_share_link_requires_view_permission_for_document(self) -> None:
+        """
+        GIVEN:
+            - A user with add_sharelink but without view permission on a document
+        WHEN:
+            - API request is made to create a share link for that document
+        THEN:
+            - Share link creation is denied until view permission is granted
+        """
+        user1 = User.objects.create_user(username="test1")
+        user1.user_permissions.add(*Permission.objects.filter(codename="add_sharelink"))
+        user1.save()
+
+        user2 = User.objects.create_user(username="test2")
+        user2.save()
+
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document which will be protected",
+            owner=user2,
+        )
+
+        self.client.force_authenticate(user1)
+
+        create_resp = self.client.post(
+            "/api/share_links/",
+            data={
+                "document": doc.pk,
+                "file_version": "original",
+            },
+            format="json",
+        )
+        self.assertEqual(create_resp.status_code, status.HTTP_403_FORBIDDEN)
+
+        assign_perm("view_document", user1, doc)
+
+        create_resp = self.client.post(
+            "/api/share_links/",
+            data={
+                "document": doc.pk,
+                "file_version": "original",
+            },
+            format="json",
+        )
+        self.assertEqual(create_resp.status_code, status.HTTP_403_FORBIDDEN)
+
+        user1.user_permissions.add(
+            Permission.objects.get(codename="view_document"),
+        )
+        user1 = User.objects.get(pk=user1.pk)
+        self.client.force_authenticate(user1)
+        create_resp = self.client.post(
+            "/api/share_links/",
+            data={
+                "document": doc.pk,
+                "file_version": "original",
+            },
+            format="json",
+        )
+        self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(create_resp.data["document"], doc.pk)
 
     def test_next_asn(self) -> None:
         """
@@ -3272,14 +4418,13 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
 
 
-class TestDocumentApiV2(DirectoriesMixin, APITestCase):
+class TestDocumentApiTagColors(DirectoriesMixin, APITestCase):
     def setUp(self) -> None:
         super().setUp()
 
         self.user = User.objects.create_superuser(username="temp_admin")
 
         self.client.force_authenticate(user=self.user)
-        self.client.defaults["HTTP_ACCEPT"] = "application/json; version=2"
 
     def test_tag_validate_color(self) -> None:
         self.assertEqual(

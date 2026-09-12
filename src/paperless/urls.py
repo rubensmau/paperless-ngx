@@ -21,12 +21,19 @@ from documents.views import BulkEditView
 from documents.views import ChatStreamingView
 from documents.views import CorrespondentViewSet
 from documents.views import CustomFieldViewSet
+from documents.views import DeleteDocumentsView
 from documents.views import DocumentTypeViewSet
+from documents.views import EditPdfDocumentsView
 from documents.views import GlobalSearchView
 from documents.views import IndexView
 from documents.views import LogViewSet
+from documents.views import MergeDocumentsAsVersionsView
+from documents.views import MergeDocumentsView
 from documents.views import PostDocumentView
 from documents.views import RemoteVersionView
+from documents.views import RemovePasswordDocumentsView
+from documents.views import ReprocessDocumentsView
+from documents.views import RotateDocumentsView
 from documents.views import SavedViewViewSet
 from documents.views import SearchAutoCompleteView
 from documents.views import SelectionDataView
@@ -92,7 +99,21 @@ urlpatterns = [
                 re_path(
                     "^auth/",
                     include(
-                        ("rest_framework.urls", "rest_framework"),
+                        (
+                            [
+                                path(
+                                    "login/",
+                                    allauth_account_views.login,
+                                    name="login",
+                                ),
+                                path(
+                                    "logout/",
+                                    allauth_account_views.logout,
+                                    name="logout",
+                                ),
+                            ],
+                            "rest_framework",
+                        ),
                         namespace="rest_framework",
                     ),
                 ),
@@ -131,6 +152,41 @@ urlpatterns = [
                                 "^bulk_edit/",
                                 BulkEditView.as_view(),
                                 name="bulk_edit",
+                            ),
+                            re_path(
+                                "^delete/",
+                                DeleteDocumentsView.as_view(),
+                                name="delete_documents",
+                            ),
+                            re_path(
+                                "^reprocess/",
+                                ReprocessDocumentsView.as_view(),
+                                name="reprocess_documents",
+                            ),
+                            re_path(
+                                "^rotate/",
+                                RotateDocumentsView.as_view(),
+                                name="rotate_documents",
+                            ),
+                            re_path(
+                                "^merge/",
+                                MergeDocumentsView.as_view(),
+                                name="merge_documents",
+                            ),
+                            re_path(
+                                "^merge_as_versions/",
+                                MergeDocumentsAsVersionsView.as_view(),
+                                name="merge_documents_as_versions",
+                            ),
+                            re_path(
+                                "^edit_pdf/",
+                                EditPdfDocumentsView.as_view(),
+                                name="edit_pdf_documents",
+                            ),
+                            re_path(
+                                "^remove_password/",
+                                RemovePasswordDocumentsView.as_view(),
+                                name="remove_password_documents",
                             ),
                             re_path(
                                 "^bulk_download/",
@@ -239,7 +295,7 @@ urlpatterns = [
             ],
         ),
     ),
-    re_path(r"share/(?P<slug>\w+)/?$", SharedLinkView.as_view()),
+    re_path(r"^share/(?P<slug>\w+)/?$", SharedLinkView.as_view()),
     re_path(r"^favicon.ico$", FaviconView.as_view(), name="favicon"),
     re_path(r"admin/", admin.site.urls),
     re_path(

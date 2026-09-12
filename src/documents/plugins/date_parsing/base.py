@@ -5,11 +5,7 @@ from abc import abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
 from types import TracebackType
-
-try:
-    from typing import Self
-except ImportError:
-    from typing_extensions import Self
+from typing import Self
 
 import dateparser
 
@@ -96,7 +92,7 @@ class DateParserPluginBase(ABC):
                 locales=self.config.languages,
             )
         except Exception as e:
-            logger.error(f"Error while parsing date string '{date_string}': {e}")
+            logger.exception(f"Error while parsing date string '{date_string}': {e}")
             return None
 
     def _filter_date(

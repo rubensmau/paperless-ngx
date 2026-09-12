@@ -26,7 +26,7 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.user = user
         self.client.force_authenticate(user=user)
 
-        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
         self.async_task = patcher.start()
         self.addCleanup(patcher.stop)
         self.c1 = Correspondent.objects.create(name="c1")
@@ -62,7 +62,7 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         m.return_value = return_value
         m.__name__ = method_name
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_set_correspondent(self, bulk_update_task_mock) -> None:
         self.assertNotEqual(self.doc1.correspondent, self.c1)
         response = self.client.post(
@@ -79,9 +79,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.doc1.refresh_from_db()
         self.assertEqual(self.doc1.correspondent, self.c1)
-        bulk_update_task_mock.assert_called_once_with(document_ids=[self.doc1.pk])
+        bulk_update_task_mock.assert_called_once()
+        self.assertCountEqual(
+            bulk_update_task_mock.call_args.kwargs["kwargs"]["document_ids"],
+            [self.doc1.pk],
+        )
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_unset_correspondent(self, bulk_update_task_mock) -> None:
         self.doc1.correspondent = self.c1
         self.doc1.save()
@@ -103,7 +107,7 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.doc1.refresh_from_db()
         self.assertIsNone(self.doc1.correspondent)
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_set_type(self, bulk_update_task_mock) -> None:
         self.assertNotEqual(self.doc1.document_type, self.dt1)
         response = self.client.post(
@@ -120,9 +124,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.doc1.refresh_from_db()
         self.assertEqual(self.doc1.document_type, self.dt1)
-        bulk_update_task_mock.assert_called_once_with(document_ids=[self.doc1.pk])
+        bulk_update_task_mock.assert_called_once()
+        self.assertCountEqual(
+            bulk_update_task_mock.call_args.kwargs["kwargs"]["document_ids"],
+            [self.doc1.pk],
+        )
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_unset_type(self, bulk_update_task_mock) -> None:
         self.doc1.document_type = self.dt1
         self.doc1.save()
@@ -141,9 +149,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.doc1.refresh_from_db()
         self.assertIsNone(self.doc1.document_type)
-        bulk_update_task_mock.assert_called_once_with(document_ids=[self.doc1.pk])
+        bulk_update_task_mock.assert_called_once()
+        self.assertCountEqual(
+            bulk_update_task_mock.call_args.kwargs["kwargs"]["document_ids"],
+            [self.doc1.pk],
+        )
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_add_tag(self, bulk_update_task_mock) -> None:
         self.assertFalse(self.doc1.tags.filter(pk=self.t1.pk).exists())
 
@@ -163,9 +175,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
 
         self.assertTrue(self.doc1.tags.filter(pk=self.t1.pk).exists())
 
-        bulk_update_task_mock.assert_called_once_with(document_ids=[self.doc1.pk])
+        bulk_update_task_mock.assert_called_once()
+        self.assertCountEqual(
+            bulk_update_task_mock.call_args.kwargs["kwargs"]["document_ids"],
+            [self.doc1.pk],
+        )
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_remove_tag(self, bulk_update_task_mock) -> None:
         self.doc1.tags.add(self.t1)
 
@@ -263,6 +279,50 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(kwargs["remove_custom_fields"], [self.cf2.id])
 
     @mock.patch("documents.serialisers.bulk_edit.modify_custom_fields")
+    def test_api_modify_custom_fields_documentlink_forbidden_for_unpermitted_target(
+        self,
+        m,
+    ) -> None:
+        self.setup_mock(m, "modify_custom_fields")
+        user = User.objects.create_user(username="doc-owner")
+        user.user_permissions.add(Permission.objects.get(codename="change_document"))
+        other_user = User.objects.create_user(username="other-user")
+        source_doc = Document.objects.create(
+            checksum="source",
+            title="Source",
+            owner=user,
+        )
+        target_doc = Document.objects.create(
+            checksum="target",
+            title="Target",
+            owner=other_user,
+        )
+        doclink_field = CustomField.objects.create(
+            name="doclink",
+            data_type=CustomField.FieldDataType.DOCUMENTLINK,
+        )
+
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "documents": [source_doc.id],
+                    "method": "modify_custom_fields",
+                    "parameters": {
+                        "add_custom_fields": {doclink_field.id: [target_doc.id]},
+                        "remove_custom_fields": [],
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        m.assert_not_called()
+
+    @mock.patch("documents.serialisers.bulk_edit.modify_custom_fields")
     def test_api_modify_custom_fields_with_values(self, m) -> None:
         self.setup_mock(m, "modify_custom_fields")
         response = self.client.post(
@@ -283,8 +343,32 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         m.assert_called_once()
         args, kwargs = m.call_args
         self.assertListEqual(args[0], [self.doc1.id, self.doc3.id])
-        self.assertEqual(kwargs["add_custom_fields"], {str(self.cf1.id): "foo"})
+        self.assertEqual(kwargs["add_custom_fields"], {self.cf1.id: "foo"})
         self.assertEqual(kwargs["remove_custom_fields"], [self.cf2.id])
+
+    @mock.patch("documents.serialisers.bulk_edit.modify_custom_fields")
+    def test_api_modify_custom_fields_rejects_invalid_value(self, m) -> None:
+        self.setup_mock(m, "modify_custom_fields")
+
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "documents": [self.doc1.id],
+                    "method": "modify_custom_fields",
+                    "parameters": {
+                        "add_custom_fields": {self.cf1.id: "x" * 129},
+                        "remove_custom_fields": [],
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("add_custom_fields", response.data)
+        self.assertIn(str(self.cf1.id), response.data["add_custom_fields"])
+        m.assert_not_called()
 
     @mock.patch("documents.serialisers.bulk_edit.modify_custom_fields")
     def test_api_modify_custom_fields_invalid_params(self, m) -> None:
@@ -422,6 +506,56 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(args[0], [self.doc1.id])
         self.assertEqual(len(kwargs), 0)
 
+    @mock.patch("documents.views.bulk_edit.delete")
+    def test_delete_documents_endpoint(self, m) -> None:
+        self.setup_mock(m, "delete")
+        response = self.client.post(
+            "/api/documents/delete/",
+            json.dumps({"documents": [self.doc1.id]}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
+        args, kwargs = m.call_args
+        self.assertEqual(args[0], [self.doc1.id])
+        self.assertEqual(len(kwargs), 0)
+
+    @mock.patch("documents.views.bulk_edit.reprocess")
+    def test_reprocess_documents_endpoint(self, m) -> None:
+        self.setup_mock(m, "reprocess")
+        response = self.client.post(
+            "/api/documents/reprocess/",
+            json.dumps({"documents": [self.doc1.id]}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
+        args, kwargs = m.call_args
+        self.assertEqual(args[0], [self.doc1.id])
+        self.assertEqual(kwargs, {"remote_ocr": False})
+
+    @mock.patch("documents.views.bulk_edit.reprocess")
+    def test_reprocess_documents_endpoint_remote_ocr(self, m) -> None:
+        """
+        GIVEN:
+            - API data to reprocess a document with remote OCR requested
+        WHEN:
+            - API is called
+        THEN:
+            - reprocess is called with remote_ocr=True
+        """
+        self.setup_mock(m, "reprocess")
+        response = self.client.post(
+            "/api/documents/reprocess/",
+            json.dumps({"documents": [self.doc1.id], "remote_ocr": True}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
+        args, kwargs = m.call_args
+        self.assertEqual(args[0], [self.doc1.id])
+        self.assertEqual(kwargs, {"remote_ocr": True})
+
     @mock.patch("documents.serialisers.bulk_edit.set_storage_path")
     def test_api_set_storage_path(self, m) -> None:
         """
@@ -541,6 +675,176 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(Document.objects.count(), 5)
+
+    def test_api_requires_documents_unless_all_is_true(self) -> None:
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "method": "set_storage_path",
+                    "parameters": {"storage_path": self.sp1.id},
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(b"documents is required unless all is true", response.content)
+
+    @mock.patch("documents.serialisers.bulk_edit.set_storage_path")
+    def test_api_bulk_edit_with_all_true_resolves_documents_from_filters(
+        self,
+        m,
+    ) -> None:
+        self.setup_mock(m, "set_storage_path")
+
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "all": True,
+                    "filters": {"title__icontains": "B"},
+                    "method": "set_storage_path",
+                    "parameters": {"storage_path": self.sp1.id},
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
+        args, kwargs = m.call_args
+        self.assertEqual(args[0], [self.doc2.id])
+        self.assertEqual(kwargs["storage_path"], self.sp1.id)
+
+    @mock.patch("documents.serialisers.bulk_edit.set_storage_path")
+    def test_api_bulk_edit_with_all_true_resolves_owned_duplicates(self, m) -> None:
+        self.setup_mock(m, "set_storage_path")
+        user = User.objects.create_user(username="duplicate-owner")
+        user.user_permissions.add(
+            Permission.objects.get(codename="change_document"),
+        )
+        first_duplicate = Document.objects.create(
+            checksum="owned-duplicate",
+            title="First duplicate",
+            owner=user,
+        )
+        second_duplicate = Document.objects.create(
+            checksum="owned-duplicate",
+            title="Second duplicate",
+            owner=user,
+        )
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "all": True,
+                    "filters": {"has_duplicates": True},
+                    "method": "set_storage_path",
+                    "parameters": {"storage_path": self.sp1.id},
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
+        args, kwargs = m.call_args
+        self.assertCountEqual(args[0], [first_duplicate.id, second_duplicate.id])
+        self.assertEqual(kwargs["storage_path"], self.sp1.id)
+
+    @mock.patch("documents.search.get_backend")
+    @mock.patch("documents.serialisers.bulk_edit.set_storage_path")
+    def test_api_bulk_edit_with_all_true_resolves_documents_from_search_filters(
+        self,
+        m,
+        get_backend,
+    ) -> None:
+        self.setup_mock(m, "set_storage_path")
+
+        for filters in (
+            {"text": "new doc 2017-03-16"},
+            {"title_search": "apple"},
+        ):
+            with self.subTest(filters=filters):
+                get_backend.return_value.search_ids.return_value = [self.doc2.id]
+
+                response = self.client.post(
+                    "/api/documents/bulk_edit/",
+                    json.dumps(
+                        {
+                            "all": True,
+                            "filters": filters,
+                            "method": "set_storage_path",
+                            "parameters": {"storage_path": self.sp1.id},
+                        },
+                    ),
+                    content_type="application/json",
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                get_backend.return_value.search_ids.assert_called_once()
+                args, kwargs = m.call_args
+                self.assertEqual(args[0], [self.doc2.id])
+                self.assertEqual(kwargs["storage_path"], self.sp1.id)
+
+                m.reset_mock()
+                get_backend.return_value.search_ids.reset_mock()
+
+        # more_like_id is a different path
+        get_backend.return_value.more_like_this_ids.return_value = [self.doc2.id]
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "all": True,
+                    "filters": {"more_like_id": self.doc1.id},
+                    "method": "set_storage_path",
+                    "parameters": {"storage_path": self.sp1.id},
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        get_backend.return_value.more_like_this_ids.assert_called_once()
+
+    def test_api_bulk_edit_with_all_true_rejects_multiple_filters(self) -> None:
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "all": True,
+                    "filters": {
+                        "text": "B",
+                        "query": "c1",
+                    },
+                    "method": "set_storage_path",
+                    "parameters": {"storage_path": self.sp1.id},
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(b"Specify only one of", response.content)
+
+    def test_api_bulk_edit_with_all_true_rejects_unsupported_methods(self) -> None:
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "all": True,
+                    "method": "merge",
+                    "parameters": {"metadata_document_id": self.doc2.id},
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(b"This method does not support all=true", response.content)
 
     def test_api_invalid_method(self) -> None:
         self.assertEqual(Document.objects.count(), 5)
@@ -773,6 +1077,35 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
             ],
         )
 
+    def test_api_selection_data_requires_view_permission(self) -> None:
+        self.doc2.owner = self.user
+        self.doc2.save()
+
+        user1 = User.objects.create(username="user1")
+        self.client.force_authenticate(user=user1)
+
+        assign_perm("view_document", user1, self.doc2)
+
+        response = self.client.post(
+            "/api/documents/selection_data/",
+            json.dumps({"documents": [self.doc2.id]}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        user1.user_permissions.add(
+            Permission.objects.get(codename="view_document"),
+        )
+        user1 = User.objects.get(pk=user1.pk)
+        self.client.force_authenticate(user=user1)
+        response = self.client.post(
+            "/api/documents/selection_data/",
+            json.dumps({"documents": [self.doc2.id]}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
     @mock.patch("documents.serialisers.bulk_edit.set_permissions")
     def test_set_permissions(self, m) -> None:
         self.setup_mock(m, "set_permissions")
@@ -807,6 +1140,30 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         args, kwargs = m.call_args
         self.assertCountEqual(args[0], [self.doc2.id, self.doc3.id])
         self.assertEqual(len(kwargs["set_permissions"]["view"]["users"]), 2)
+
+    @mock.patch("documents.serialisers.bulk_edit.set_permissions")
+    def test_set_permissions_requires_set_permissions_parameter(self, m) -> None:
+        self.setup_mock(m, "set_permissions")
+
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id],
+                    "method": "set_permissions",
+                    "parameters": {
+                        "owner": self.user.id,
+                        "merge": True,
+                        "permissions": {"view": {"users": [self.user.id]}},
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(b"set_permissions not specified", response.content)
+        m.assert_not_called()
 
     @mock.patch("documents.serialisers.bulk_edit.set_permissions")
     def test_set_permissions_merge(self, m) -> None:
@@ -861,7 +1218,7 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(kwargs["merge"], True)
 
     @mock.patch("documents.serialisers.bulk_edit.set_storage_path")
-    @mock.patch("documents.serialisers.bulk_edit.merge")
+    @mock.patch("documents.views.bulk_edit.merge")
     def test_insufficient_global_perms(self, mock_merge, mock_set_storage) -> None:
         """
         GIVEN:
@@ -896,12 +1253,11 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         mock_set_storage.assert_not_called()
 
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/merge/",
             json.dumps(
                 {
                     "documents": [self.doc1.id],
-                    "method": "merge",
-                    "parameters": {"metadata_document_id": self.doc1.id},
+                    "metadata_document_id": self.doc1.id,
                 },
             ),
             content_type="application/json",
@@ -911,15 +1267,12 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         mock_merge.assert_not_called()
 
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/merge/",
             json.dumps(
                 {
                     "documents": [self.doc1.id],
-                    "method": "merge",
-                    "parameters": {
-                        "metadata_document_id": self.doc1.id,
-                        "delete_originals": True,
-                    },
+                    "metadata_document_id": self.doc1.id,
+                    "delete_originals": True,
                 },
             ),
             content_type="application/json",
@@ -1036,85 +1389,57 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
 
         m.assert_called_once()
 
-    @mock.patch("documents.serialisers.bulk_edit.rotate")
+    @mock.patch("documents.views.bulk_edit.rotate")
     def test_rotate(self, m) -> None:
         self.setup_mock(m, "rotate")
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/rotate/",
             json.dumps(
                 {
                     "documents": [self.doc2.id, self.doc3.id],
-                    "method": "rotate",
-                    "parameters": {"degrees": 90},
+                    "degrees": 90,
                 },
             ),
             content_type="application/json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-
         m.assert_called_once()
         args, kwargs = m.call_args
         self.assertCountEqual(args[0], [self.doc2.id, self.doc3.id])
         self.assertEqual(kwargs["degrees"], 90)
-
-    @mock.patch("documents.serialisers.bulk_edit.rotate")
-    def test_rotate_invalid_params(self, m) -> None:
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id, self.doc3.id],
-                    "method": "rotate",
-                    "parameters": {"degrees": "foo"},
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id, self.doc3.id],
-                    "method": "rotate",
-                    "parameters": {"degrees": 90.5},
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-        m.assert_not_called()
-
-    @mock.patch("documents.serialisers.bulk_edit.merge")
-    def test_merge(self, m) -> None:
-        self.setup_mock(m, "merge")
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id, self.doc3.id],
-                    "method": "merge",
-                    "parameters": {"metadata_document_id": self.doc3.id},
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        m.assert_called_once()
-        args, kwargs = m.call_args
-        self.assertCountEqual(args[0], [self.doc2.id, self.doc3.id])
-        self.assertEqual(kwargs["metadata_document_id"], self.doc3.id)
+        self.assertEqual(kwargs["source_mode"], "latest_version")
         self.assertEqual(kwargs["user"], self.user)
 
-    @mock.patch("documents.serialisers.bulk_edit.merge")
-    def test_merge_and_delete_insufficient_permissions(self, m) -> None:
+    @mock.patch("documents.views.bulk_edit.rotate")
+    def test_rotate_invalid_params(self, m) -> None:
+        response = self.client.post(
+            "/api/documents/rotate/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id, self.doc3.id],
+                    "degrees": "foo",
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = self.client.post(
+            "/api/documents/rotate/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id, self.doc3.id],
+                    "degrees": 90.5,
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        m.assert_not_called()
+
+    @mock.patch("documents.views.bulk_edit.rotate")
+    def test_rotate_insufficient_permissions(self, m) -> None:
         self.doc1.owner = User.objects.get(username="temp_admin")
         self.doc1.save()
         user1 = User.objects.create(username="user1")
@@ -1122,17 +1447,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         user1.save()
         self.client.force_authenticate(user=user1)
 
-        self.setup_mock(m, "merge")
+        self.setup_mock(m, "rotate")
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/rotate/",
             json.dumps(
                 {
                     "documents": [self.doc1.id, self.doc2.id],
-                    "method": "merge",
-                    "parameters": {
-                        "metadata_document_id": self.doc2.id,
-                        "delete_originals": True,
-                    },
+                    "degrees": 90,
                 },
             ),
             content_type="application/json",
@@ -1143,15 +1464,11 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.content, b"Insufficient permissions")
 
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/rotate/",
             json.dumps(
                 {
                     "documents": [self.doc2.id, self.doc3.id],
-                    "method": "merge",
-                    "parameters": {
-                        "metadata_document_id": self.doc2.id,
-                        "delete_originals": True,
-                    },
+                    "degrees": 90,
                 },
             ),
             content_type="application/json",
@@ -1160,27 +1477,102 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         m.assert_called_once()
 
-    @mock.patch("documents.serialisers.bulk_edit.merge")
-    def test_merge_invalid_parameters(self, m) -> None:
-        """
-        GIVEN:
-            - API data for merging documents is called
-            - The parameters are invalid
-        WHEN:
-            - API is called
-        THEN:
-            - The API fails with a correct error code
-        """
+    @mock.patch("documents.views.bulk_edit.merge")
+    def test_merge(self, m) -> None:
         self.setup_mock(m, "merge")
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/merge/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id, self.doc3.id],
+                    "metadata_document_id": self.doc3.id,
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
+        args, kwargs = m.call_args
+        self.assertCountEqual(args[0], [self.doc2.id, self.doc3.id])
+        self.assertEqual(kwargs["metadata_document_id"], self.doc3.id)
+        self.assertEqual(kwargs["source_mode"], "latest_version")
+        self.assertEqual(kwargs["user"], self.user)
+
+    @mock.patch("documents.views.bulk_edit.merge")
+    def test_merge_and_delete_insufficient_permissions(self, m) -> None:
+        self.doc1.owner = User.objects.get(username="temp_admin")
+        self.doc1.save()
+        user1 = User.objects.create(username="user1")
+        user1.user_permissions.add(*Permission.objects.all())
+        user1.save()
+        self.client.force_authenticate(user=user1)
+
+        self.setup_mock(m, "merge")
+        response = self.client.post(
+            "/api/documents/merge/",
             json.dumps(
                 {
                     "documents": [self.doc1.id, self.doc2.id],
-                    "method": "merge",
-                    "parameters": {
-                        "delete_originals": "not_boolean",
-                    },
+                    "metadata_document_id": self.doc2.id,
+                    "delete_originals": True,
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        m.assert_not_called()
+        self.assertEqual(response.content, b"Insufficient permissions")
+
+        response = self.client.post(
+            "/api/documents/merge/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id, self.doc3.id],
+                    "metadata_document_id": self.doc2.id,
+                    "delete_originals": True,
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
+
+    @mock.patch("documents.views.bulk_edit.merge")
+    def test_merge_and_delete_requires_change_permission(self, m) -> None:
+        self.setup_mock(m, "merge")
+        user = User.objects.create_user(username="no-change")
+        user.user_permissions.add(
+            Permission.objects.get(codename="add_document"),
+            Permission.objects.get(codename="delete_document"),
+        )
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(
+            "/api/documents/merge/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id, self.doc3.id],
+                    "delete_originals": True,
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        m.assert_not_called()
+
+    @mock.patch("documents.views.bulk_edit.merge")
+    def test_merge_invalid_parameters(self, m) -> None:
+        self.setup_mock(m, "merge")
+        response = self.client.post(
+            "/api/documents/merge/",
+            json.dumps(
+                {
+                    "documents": [self.doc1.id, self.doc2.id],
+                    "delete_originals": "not_boolean",
                 },
             ),
             content_type="application/json",
@@ -1189,219 +1581,104 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         m.assert_not_called()
 
-    @mock.patch("documents.serialisers.bulk_edit.split")
-    def test_split(self, m) -> None:
-        self.setup_mock(m, "split")
+    def test_bulk_edit_allows_legacy_file_methods_with_warning(self) -> None:
+        method_payloads = {
+            "delete": {},
+            "reprocess": {},
+            "rotate": {"degrees": 90},
+            "merge": {"metadata_document_id": self.doc2.id},
+            "edit_pdf": {"operations": [{"page": 1}]},
+            "remove_password": {"password": "secret"},
+            "split": {"pages": "1,2-4"},
+            "delete_pages": {"pages": [1, 2]},
+        }
+
+        for version in (9, 10):
+            for method, parameters in method_payloads.items():
+                with self.subTest(method=method, version=version):
+                    with mock.patch(
+                        f"documents.views.bulk_edit.{method}",
+                    ) as mocked_method:
+                        self.setup_mock(mocked_method, method)
+                        with self.assertLogs("paperless.api", level="WARNING") as logs:
+                            response = self.client.post(
+                                "/api/documents/bulk_edit/",
+                                json.dumps(
+                                    {
+                                        "documents": [self.doc2.id],
+                                        "method": method,
+                                        "parameters": parameters,
+                                    },
+                                ),
+                                content_type="application/json",
+                                headers={
+                                    "Accept": f"application/json; version={version}",
+                                },
+                            )
+
+                        self.assertEqual(response.status_code, status.HTTP_200_OK)
+                        mocked_method.assert_called_once()
+                        self.assertTrue(
+                            any(
+                                "Deprecated bulk_edit method" in entry
+                                and f"'{method}'" in entry
+                                for entry in logs.output
+                            ),
+                        )
+
+    def test_legacy_bulk_edit_reprocess_invalid_remote_ocr(self) -> None:
+        """
+        GIVEN:
+            - The deprecated bulk_edit endpoint with a non-boolean remote_ocr
+        WHEN:
+            - API is called
+        THEN:
+            - The request is rejected rather than passed through to the task
+        """
         response = self.client.post(
             "/api/documents/bulk_edit/",
             json.dumps(
                 {
-                    "documents": [self.doc2.id],
-                    "method": "split",
-                    "parameters": {"pages": "1,2-4,5-6,7"},
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        m.assert_called_once()
-        args, kwargs = m.call_args
-        self.assertCountEqual(args[0], [self.doc2.id])
-        self.assertEqual(kwargs["pages"], [[1], [2, 3, 4], [5, 6], [7]])
-        self.assertEqual(kwargs["user"], self.user)
-
-    def test_split_invalid_params(self) -> None:
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "split",
-                    "parameters": {},  # pages not specified
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"pages not specified", response.content)
-
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "split",
-                    "parameters": {"pages": "1:7"},  # wrong format
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"invalid pages specified", response.content)
-
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [
-                        self.doc1.id,
-                        self.doc2.id,
-                    ],  # only one document supported
-                    "method": "split",
-                    "parameters": {"pages": "1-2,3-7"},  # wrong format
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"Split method only supports one document", response.content)
-
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "split",
-                    "parameters": {
-                        "pages": "1",
-                        "delete_originals": "notabool",
-                    },  # not a bool
+                    "documents": [self.doc1.id],
+                    "method": "reprocess",
+                    "parameters": {"remote_ocr": "yes please"},
                 },
             ),
             content_type="application/json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"delete_originals must be a boolean", response.content)
 
-    @mock.patch("documents.serialisers.bulk_edit.delete_pages")
-    def test_delete_pages(self, m) -> None:
-        self.setup_mock(m, "delete_pages")
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "delete_pages",
-                    "parameters": {"pages": [1, 2, 3, 4]},
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        m.assert_called_once()
-        args, kwargs = m.call_args
-        self.assertCountEqual(args[0], [self.doc2.id])
-        self.assertEqual(kwargs["pages"], [1, 2, 3, 4])
-
-    def test_delete_pages_invalid_params(self) -> None:
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [
-                        self.doc1.id,
-                        self.doc2.id,
-                    ],  # only one document supported
-                    "method": "delete_pages",
-                    "parameters": {
-                        "pages": [1, 2, 3, 4],
-                    },
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(
-            b"Delete pages method only supports one document",
-            response.content,
-        )
-
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "delete_pages",
-                    "parameters": {},  # pages not specified
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"pages not specified", response.content)
-
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "delete_pages",
-                    "parameters": {"pages": "1-3"},  # not a list
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"pages must be a list", response.content)
-
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "delete_pages",
-                    "parameters": {"pages": ["1-3"]},  # not ints
-                },
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"pages must be a list of integers", response.content)
-
-    @mock.patch("documents.serialisers.bulk_edit.edit_pdf")
+    @mock.patch("documents.views.bulk_edit.edit_pdf")
     def test_edit_pdf(self, m) -> None:
         self.setup_mock(m, "edit_pdf")
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {"operations": [{"page": 1}]},
+                    "operations": [{"page": 1}],
+                    "source_mode": "explicit_selection",
                 },
             ),
             content_type="application/json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-
         m.assert_called_once()
         args, kwargs = m.call_args
         self.assertCountEqual(args[0], [self.doc2.id])
         self.assertEqual(kwargs["operations"], [{"page": 1}])
+        self.assertEqual(kwargs["source_mode"], "explicit_selection")
         self.assertEqual(kwargs["user"], self.user)
 
     def test_edit_pdf_invalid_params(self) -> None:
-        # multiple documents
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id, self.doc3.id],
-                    "method": "edit_pdf",
-                    "parameters": {"operations": [{"page": 1}]},
+                    "operations": [{"page": 1}],
                 },
             ),
             content_type="application/json",
@@ -1409,44 +1686,25 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(b"Edit PDF method only supports one document", response.content)
 
-        # no operations specified
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {},
+                    "operations": "not_a_list",
                 },
             ),
             content_type="application/json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"operations not specified", response.content)
+        self.assertIn(b"Expected a list of items", response.content)
 
-        # operations not a list
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {"operations": "not_a_list"},
-                },
-            ),
-            content_type="application/json",
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"operations must be a list", response.content)
-
-        # invalid operation
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {"operations": ["invalid_operation"]},
+                    "operations": ["invalid_operation"],
                 },
             ),
             content_type="application/json",
@@ -1454,14 +1712,12 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(b"invalid operation entry", response.content)
 
-        # page not an int
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {"operations": [{"page": "not_an_int"}]},
+                    "operations": [{"page": "not_an_int"}],
                 },
             ),
             content_type="application/json",
@@ -1469,14 +1725,12 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(b"page must be an integer", response.content)
 
-        # rotate not an int
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {"operations": [{"page": 1, "rotate": "not_an_int"}]},
+                    "operations": [{"page": 1, "rotate": "not_an_int"}],
                 },
             ),
             content_type="application/json",
@@ -1484,14 +1738,12 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(b"rotate must be an integer", response.content)
 
-        # doc not an int
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {"operations": [{"page": 1, "doc": "not_an_int"}]},
+                    "operations": [{"page": 1, "doc": "not_an_int"}],
                 },
             ),
             content_type="application/json",
@@ -1499,53 +1751,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(b"doc must be an integer", response.content)
 
-        # update_document not a boolean
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {
-                        "update_document": "not_a_bool",
-                        "operations": [{"page": 1}],
-                    },
-                },
-            ),
-            content_type="application/json",
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"update_document must be a boolean", response.content)
-
-        # include_metadata not a boolean
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {
-                        "include_metadata": "not_a_bool",
-                        "operations": [{"page": 1}],
-                    },
-                },
-            ),
-            content_type="application/json",
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"include_metadata must be a boolean", response.content)
-
-        # update_document True but output would be multiple documents
-        response = self.client.post(
-            "/api/documents/bulk_edit/",
-            json.dumps(
-                {
-                    "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {
-                        "update_document": True,
-                        "operations": [{"page": 1, "doc": 1}, {"page": 2, "doc": 2}],
-                    },
+                    "update_document": True,
+                    "operations": [{"page": 1, "doc": 1}, {"page": 2, "doc": 2}],
                 },
             ),
             content_type="application/json",
@@ -1556,42 +1768,152 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
             response.content,
         )
 
-    @mock.patch("documents.serialisers.bulk_edit.edit_pdf")
-    def test_edit_pdf_page_out_of_bounds(self, m) -> None:
-        """
-        GIVEN:
-            - API data for editing PDF is called
-            - The page number is out of bounds
-        WHEN:
-            - API is called
-        THEN:
-            - The API fails with a correct error code
-        """
-        self.setup_mock(m, "edit_pdf")
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "edit_pdf",
-                    "parameters": {"operations": [{"page": 99}]},
+                    "operations": [{"page": 1}],
+                    "source_mode": "not_a_mode",
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(b"Invalid source_mode", response.content)
+
+    @mock.patch("documents.views.bulk_edit.edit_pdf")
+    def test_edit_pdf_page_out_of_bounds(self, m) -> None:
+        self.setup_mock(m, "edit_pdf")
+        response = self.client.post(
+            "/api/documents/edit_pdf/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id],
+                    "operations": [{"page": 99}],
                 },
             ),
             content_type="application/json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(b"out of bounds", response.content)
+        m.assert_not_called()
 
-    @mock.patch("documents.serialisers.bulk_edit.remove_password")
-    def test_remove_password(self, m) -> None:
-        self.setup_mock(m, "remove_password")
+    @mock.patch("documents.views.bulk_edit.edit_pdf")
+    def test_edit_pdf_insufficient_permissions(self, m) -> None:
+        self.doc1.owner = User.objects.get(username="temp_admin")
+        self.doc1.save()
+        user1 = User.objects.create(username="user1")
+        user1.user_permissions.add(*Permission.objects.all())
+        user1.save()
+        self.client.force_authenticate(user=user1)
+
+        self.setup_mock(m, "edit_pdf")
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/edit_pdf/",
+            json.dumps(
+                {
+                    "documents": [self.doc1.id],
+                    "operations": [{"page": 1}],
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        m.assert_not_called()
+        self.assertEqual(response.content, b"Insufficient permissions")
+
+        response = self.client.post(
+            "/api/documents/edit_pdf/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "remove_password",
-                    "parameters": {"password": "secret", "update_document": True},
+                    "operations": [{"page": 1}],
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
+
+    @mock.patch("documents.views.bulk_edit.edit_pdf")
+    def test_edit_pdf_update_requires_change_permission(self, m) -> None:
+        self.setup_mock(m, "edit_pdf")
+        user = User.objects.create_user(username="no-change")
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(
+            "/api/documents/edit_pdf/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id],
+                    "operations": [{"page": 1}],
+                    "update_document": True,
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        m.assert_not_called()
+
+    @mock.patch("documents.views.bulk_edit.remove_password")
+    @mock.patch("documents.views.bulk_edit.edit_pdf")
+    def test_delete_original_requires_delete_permission(
+        self,
+        edit_pdf_mock,
+        remove_password_mock,
+    ) -> None:
+        self.setup_mock(edit_pdf_mock, "edit_pdf")
+        self.setup_mock(remove_password_mock, "remove_password")
+        user = User.objects.create_user(username="no-delete")
+        user.user_permissions.add(
+            Permission.objects.get(codename="add_document"),
+            Permission.objects.get(codename="change_document"),
+        )
+        self.client.force_authenticate(user=user)
+
+        cases = [
+            (
+                "/api/documents/edit_pdf/",
+                {
+                    "documents": [self.doc2.id],
+                    "operations": [{"page": 1}],
+                    "delete_original": True,
+                },
+                edit_pdf_mock,
+            ),
+            (
+                "/api/documents/remove_password/",
+                {
+                    "documents": [self.doc2.id],
+                    "password": "secret",
+                    "delete_original": True,
+                },
+                remove_password_mock,
+            ),
+        ]
+        for endpoint, payload, operation_mock in cases:
+            with self.subTest(endpoint=endpoint):
+                response = self.client.post(
+                    endpoint,
+                    json.dumps(payload),
+                    content_type="application/json",
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+                operation_mock.assert_not_called()
+
+    @mock.patch("documents.views.bulk_edit.remove_password")
+    def test_remove_password(self, m) -> None:
+        self.setup_mock(m, "remove_password")
+        response = self.client.post(
+            "/api/documents/remove_password/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id],
+                    "password": "secret",
+                    "update_document": True,
                 },
             ),
             content_type="application/json",
@@ -1603,36 +1925,69 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertCountEqual(args[0], [self.doc2.id])
         self.assertEqual(kwargs["password"], "secret")
         self.assertTrue(kwargs["update_document"])
+        self.assertEqual(kwargs["source_mode"], "latest_version")
         self.assertEqual(kwargs["user"], self.user)
 
     def test_remove_password_invalid_params(self) -> None:
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/remove_password/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "remove_password",
-                    "parameters": {},
                 },
             ),
             content_type="application/json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"password not specified", response.content)
 
         response = self.client.post(
-            "/api/documents/bulk_edit/",
+            "/api/documents/remove_password/",
             json.dumps(
                 {
                     "documents": [self.doc2.id],
-                    "method": "remove_password",
-                    "parameters": {"password": 123},
+                    "password": 123,
                 },
             ),
             content_type="application/json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn(b"password must be a string", response.content)
+
+    @mock.patch("documents.views.bulk_edit.remove_password")
+    def test_remove_password_insufficient_permissions(self, m) -> None:
+        self.doc1.owner = User.objects.get(username="temp_admin")
+        self.doc1.save()
+        user1 = User.objects.create(username="user1")
+        user1.user_permissions.add(*Permission.objects.all())
+        user1.save()
+        self.client.force_authenticate(user=user1)
+
+        self.setup_mock(m, "remove_password")
+        response = self.client.post(
+            "/api/documents/remove_password/",
+            json.dumps(
+                {
+                    "documents": [self.doc1.id],
+                    "password": "secret",
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        m.assert_not_called()
+        self.assertEqual(response.content, b"Insufficient permissions")
+
+        response = self.client.post(
+            "/api/documents/remove_password/",
+            json.dumps(
+                {
+                    "documents": [self.doc2.id],
+                    "password": "secret",
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        m.assert_called_once()
 
     @override_settings(AUDIT_LOG_ENABLED=True)
     def test_bulk_edit_audit_log_enabled_simple_field(self) -> None:

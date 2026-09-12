@@ -1,5 +1,6 @@
 import { PdfEditorEditMode } from '../components/common/pdf-editor/pdf-editor-edit-mode'
 import { PdfZoomScale } from '../components/common/pdf-viewer/pdf-viewer.types'
+import { RemoteOCRModeConfig } from './paperless-config'
 import { User } from './user'
 
 export interface UiSettings {
@@ -18,6 +19,20 @@ export enum GlobalSearchType {
   ADVANCED = 'advanced',
   TITLE_CONTENT = 'title-content',
 }
+
+export enum CollapsibleSection {
+  ATTRIBUTES = 'attributes',
+}
+
+export enum HideableSidebarItemID {
+  Dashboard = 'dashboard',
+  SavedViews = 'saved_views',
+  Workflows = 'workflows',
+  Mail = 'mail',
+  Documentation = 'documentation',
+}
+
+export const HIDEABLE_SIDEBAR_ITEM_IDS = Object.values(HideableSidebarItemID)
 
 export const PAPERLESS_GREEN_HEX = '#17541f'
 
@@ -51,11 +66,18 @@ export const SETTINGS_KEYS = {
   NOTES_ENABLED: 'general-settings:notes-enabled',
   AUDITLOG_ENABLED: 'general-settings:auditlog-enabled',
   SLIM_SIDEBAR: 'general-settings:slim-sidebar',
+  SIDEBAR_HIDDEN_ITEMS: 'general-settings:sidebar:hidden-items',
+  ATTRIBUTES_SECTIONS_COLLAPSED:
+    'general-settings:attributes-sections-collapsed',
   UPDATE_CHECKING_ENABLED: 'general-settings:update-checking:enabled',
   UPDATE_CHECKING_BACKEND_SETTING:
     'general-settings:update-checking:backend-setting',
   SAVED_VIEWS_WARN_ON_UNSAVED_CHANGE:
     'general-settings:saved-views:warn-on-unsaved-change',
+  DASHBOARD_VIEWS_VISIBLE_IDS:
+    'general-settings:saved-views:dashboard-views-visible-ids',
+  SIDEBAR_VIEWS_VISIBLE_IDS:
+    'general-settings:saved-views:sidebar-views-visible-ids',
   DASHBOARD_VIEWS_SORT_ORDER:
     'general-settings:saved-views:dashboard-views-sort-order',
   SIDEBAR_VIEWS_SORT_ORDER:
@@ -73,6 +95,8 @@ export const SETTINGS_KEYS = {
     'general-settings:document-editing:remove-inbox-tags',
   DOCUMENT_EDITING_OVERLAY_THUMBNAIL:
     'general-settings:document-editing:overlay-thumbnail',
+  DOCUMENT_EDITING_AUTO_SUGGEST:
+    'general-settings:document-editing:auto-suggest',
   DOCUMENT_DETAILS_HIDDEN_FIELDS:
     'general-settings:document-details:hidden-fields',
   SEARCH_DB_ONLY: 'general-settings:search:db-only',
@@ -84,6 +108,8 @@ export const SETTINGS_KEYS = {
   OUTLOOK_OAUTH_URL: 'outlook_oauth_url',
   EMAIL_ENABLED: 'email_enabled',
   AI_ENABLED: 'ai_enabled',
+  REMOTE_OCR_CONFIGURED: 'remote_ocr:configured',
+  REMOTE_OCR_MODE: 'remote_ocr:mode',
 }
 
 export const SETTINGS: UiSetting[] = [
@@ -111,6 +137,16 @@ export const SETTINGS: UiSetting[] = [
     key: SETTINGS_KEYS.SLIM_SIDEBAR,
     type: 'boolean',
     default: false,
+  },
+  {
+    key: SETTINGS_KEYS.SIDEBAR_HIDDEN_ITEMS,
+    type: 'array',
+    default: [],
+  },
+  {
+    key: SETTINGS_KEYS.ATTRIBUTES_SECTIONS_COLLAPSED,
+    type: 'array',
+    default: [],
   },
   {
     key: SETTINGS_KEYS.DOCUMENT_LIST_SIZE,
@@ -238,6 +274,16 @@ export const SETTINGS: UiSetting[] = [
     default: [],
   },
   {
+    key: SETTINGS_KEYS.DASHBOARD_VIEWS_VISIBLE_IDS,
+    type: 'array',
+    default: [],
+  },
+  {
+    key: SETTINGS_KEYS.SIDEBAR_VIEWS_VISIBLE_IDS,
+    type: 'array',
+    default: [],
+  },
+  {
     key: SETTINGS_KEYS.DASHBOARD_VIEWS_SORT_ORDER,
     type: 'array',
     default: [],
@@ -269,6 +315,11 @@ export const SETTINGS: UiSetting[] = [
   },
   {
     key: SETTINGS_KEYS.DOCUMENT_EDITING_OVERLAY_THUMBNAIL,
+    type: 'boolean',
+    default: true,
+  },
+  {
+    key: SETTINGS_KEYS.DOCUMENT_EDITING_AUTO_SUGGEST,
     type: 'boolean',
     default: true,
   },
@@ -321,5 +372,15 @@ export const SETTINGS: UiSetting[] = [
     key: SETTINGS_KEYS.PDF_EDITOR_DEFAULT_EDIT_MODE,
     type: 'string',
     default: PdfEditorEditMode.Create,
+  },
+  {
+    key: SETTINGS_KEYS.REMOTE_OCR_CONFIGURED,
+    type: 'boolean',
+    default: false,
+  },
+  {
+    key: SETTINGS_KEYS.REMOTE_OCR_MODE,
+    type: 'string',
+    default: RemoteOCRModeConfig.ALWAYS,
   },
 ]

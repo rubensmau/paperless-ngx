@@ -3,7 +3,7 @@ import {
   DragDropModule,
   moveItemInArray,
 } from '@angular/cdk/drag-drop'
-import { Component, inject } from '@angular/core'
+import { Component, inject, signal } from '@angular/core'
 import { FormsModule } from '@angular/forms'
 import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap'
 import { NgxBootstrapIconsModule } from 'ngx-bootstrap-icons'
@@ -45,7 +45,9 @@ export class PDFEditorComponent extends ConfirmDialogComponent {
   private readonly settingsService = inject(SettingsService)
   activeModal: NgbActiveModal = inject(NgbActiveModal)
 
-  documentID: number
+  readonly documentID = signal<number>(undefined)
+  readonly versionID = signal<number>(undefined)
+
   pages: PageOperation[] = []
   totalPages = 0
   editMode: PdfEditorEditMode = this.settingsService.get(
@@ -55,7 +57,11 @@ export class PDFEditorComponent extends ConfirmDialogComponent {
   includeMetadata: boolean = true
 
   get pdfSrc(): string {
-    return this.documentService.getPreviewUrl(this.documentID)
+    return this.documentService.getPreviewUrl(
+      this.documentID(),
+      false,
+      this.versionID()
+    )
   }
 
   pdfLoaded(pdf: PngxPdfDocumentProxy) {

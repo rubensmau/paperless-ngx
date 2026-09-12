@@ -7,10 +7,11 @@ from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Literal
+from typing import TypedDict
 
 import magic
-from celery import states
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import User
@@ -46,6 +47,7 @@ from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.fields import SerializerMethodField
 from rest_framework.filters import OrderingFilter
+from rest_framework.utils import model_meta
 
 if settings.AUDIT_LOG_ENABLED:
     from auditlog.context import set_actor
@@ -77,25 +79,32 @@ from documents.models import WorkflowTrigger
 from documents.parsers import is_mime_type_supported
 from documents.permissions import get_document_count_filter_for_user
 from documents.permissions import get_groups_with_only_permission
-from documents.permissions import get_objects_for_user_owner_aware
+from documents.permissions import has_perms_owner_aware
+from documents.permissions import permitted_document_ids
+from documents.permissions import restrict_queryset_to_visible
 from documents.permissions import set_permissions_for_object
 from documents.regex import validate_regex_pattern
 from documents.templating.filepath import validate_filepath_template_and_render
 from documents.templating.utils import convert_format_str_to_template_format
+from documents.templating.workflows import validate_workflow_template
 from documents.validators import uri_validator
 from documents.validators import url_validator
+from documents.versioning import has_prefetched_effective_content
+from documents.versioning import sort_versions_newest_first
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from django.db.models.query import QuerySet
+    from rest_framework.relations import ManyRelatedField
+    from rest_framework.relations import RelatedField
 
 
 logger = logging.getLogger("paperless.serializers")
 
 
 # https://www.django-rest-framework.org/api-guide/serializers/#example
-class DynamicFieldsModelSerializer(serializers.ModelSerializer):
+class DynamicFieldsModelSerializer(serializers.ModelSerializer[Any]):
     """
     A ModelSerializer that takes an additional `fields` argument that
     controls which fields should be displayed.
@@ -116,7 +125,46 @@ class DynamicFieldsModelSerializer(serializers.ModelSerializer):
                 self.fields.pop(field_name)
 
 
-class MatchingModelSerializer(serializers.ModelSerializer):
+class DocumentUpdateFieldsModelSerializer(DynamicFieldsModelSerializer):
+    stale_update_excluded_fields = frozenset({"filename", "archive_filename"})
+
+    def _get_update_fields(self, validated_data) -> list[str]:
+        model_fields = {
+            field.name
+            for field in self.Meta.model._meta.concrete_fields
+            if field.name not in self.stale_update_excluded_fields
+        }
+        update_fields = [
+            field_name for field_name in validated_data if field_name in model_fields
+        ]
+        if "modified" in model_fields and "modified" not in update_fields:
+            update_fields.append("modified")
+        return update_fields
+
+    def update(self, instance, validated_data):
+        serializers.raise_errors_on_nested_writes("update", self, validated_data)
+        info = model_meta.get_field_info(instance)
+
+        m2m_fields = []
+        for attr, value in validated_data.items():
+            if attr in info.relations and info.relations[attr].to_many:
+                m2m_fields.append((attr, value))
+            else:
+                setattr(instance, attr, value)
+
+        # File names are managed by post-save file handling.  Saving only the
+        # serializer-updated fields prevents stale in-memory path values from
+        # overwriting a concurrent move.
+        instance.save(update_fields=self._get_update_fields(validated_data))
+
+        for attr, value in m2m_fields:
+            field = getattr(instance, attr)
+            field.set(value)
+
+        return instance
+
+
+class MatchingModelSerializer(serializers.ModelSerializer[Any]):
     document_count = serializers.IntegerField(read_only=True)
 
     def get_slug(self, obj) -> str:
@@ -209,7 +257,7 @@ class SetPermissionsMixin:
         set_permissions_for_object(permissions, object)
 
 
-class SerializerWithPerms(serializers.Serializer):
+class SerializerWithPerms(serializers.Serializer[dict[str, Any]]):
     def __init__(self, *args, **kwargs) -> None:
         self.user = kwargs.pop("user", None)
         self.full_perms = kwargs.pop("full_perms", False)
@@ -256,7 +304,7 @@ class SetPermissionsSerializer(serializers.DictField):
 
 class OwnedObjectSerializer(
     SerializerWithPerms,
-    serializers.ModelSerializer,
+    serializers.ModelSerializer[Any],
     SetPermissionsMixin,
 ):
     def __init__(self, *args, **kwargs) -> None:
@@ -347,15 +395,34 @@ class OwnedObjectSerializer(
         }
 
     def get_user_can_change(self, obj) -> bool:
-        checker = ObjectPermissionChecker(self.user) if self.user is not None else None
-        return (
-            obj.owner is None
-            or obj.owner == self.user
-            or (
-                self.user is not None
-                and checker.has_perm(f"change_{obj.__class__.__name__.lower()}", obj)
+        if obj.owner is None or obj.owner == self.user:
+            return True
+        if self.user is None:
+            return False
+        if self.user.is_active and self.user.is_superuser:
+            # Mirrors guardian's own ObjectPermissionChecker.has_perm() shortcut --
+            # superusers aren't necessarily granted explicit object permissions,
+            # so the batched context below would otherwise incorrectly say no.
+            return True
+
+        # Prefer the page-level batch computed by BulkPermissionMixin
+        # (get_serializer_context) over a fresh per-object guardian check,
+        # which would otherwise query the permission tables once per row.
+        users_change_perms = self.context.get("users_change_perms")
+        groups_change_perms = self.context.get("groups_change_perms")
+        if users_change_perms is not None and groups_change_perms is not None:
+            if self.user.pk in users_change_perms.get(obj.pk, []):
+                return True
+            user_group_ids = getattr(self, "_user_group_ids", None)
+            if user_group_ids is None:
+                user_group_ids = set(self.user.groups.values_list("id", flat=True))
+                self._user_group_ids = user_group_ids
+            return bool(
+                user_group_ids.intersection(groups_change_perms.get(obj.pk, [])),
             )
-        )
+
+        checker = ObjectPermissionChecker(self.user)
+        return checker.has_perm(f"change_{obj.__class__.__name__.lower()}", obj)
 
     @staticmethod
     def get_shared_object_pks(objects: Iterable):
@@ -464,7 +531,7 @@ class OwnedObjectSerializer(
         return super().update(instance, validated_data)
 
 
-class OwnedObjectListSerializer(serializers.ListSerializer):
+class OwnedObjectListSerializer(serializers.ListSerializer[Any]):
     def to_representation(self, documents):
         self.child.context["shared_object_pks"] = self.child.get_shared_object_pks(
             documents,
@@ -548,28 +615,6 @@ class ColorField(serializers.Field):
         return 1
 
 
-class TagSerializerVersion1(MatchingModelSerializer, OwnedObjectSerializer):
-    colour = ColorField(source="color", default="#a6cee3")
-
-    class Meta:
-        model = Tag
-        fields = (
-            "id",
-            "slug",
-            "name",
-            "colour",
-            "match",
-            "matching_algorithm",
-            "is_insensitive",
-            "is_inbox_tag",
-            "document_count",
-            "owner",
-            "permissions",
-            "user_can_change",
-            "set_permissions",
-        )
-
-
 class TagSerializer(MatchingModelSerializer, OwnedObjectSerializer):
     def get_text_color(self, obj) -> str:
         try:
@@ -618,6 +663,8 @@ class TagSerializer(MatchingModelSerializer, OwnedObjectSerializer):
                 .select_related("owner")
                 .annotate(document_count=Count("documents", filter=filter_q))
             )
+            user = getattr(request, "user", None) if request else self.user
+            children = restrict_queryset_to_visible(children, user, "view_tag")
 
             view = self.context.get("view")
             ordering = (
@@ -627,6 +674,9 @@ class TagSerializer(MatchingModelSerializer, OwnedObjectSerializer):
             )
             ordering = ordering or (Lower("name"),)
             children = children.order_by(*ordering)
+
+        if not children:
+            return []
 
         serializer = TagSerializer(
             children,
@@ -699,36 +749,27 @@ class TagSerializer(MatchingModelSerializer, OwnedObjectSerializer):
         return super().validate(attrs)
 
 
-class CorrespondentField(serializers.PrimaryKeyRelatedField):
+class CorrespondentField(serializers.PrimaryKeyRelatedField[Correspondent]):
     def get_queryset(self):
         return Correspondent.objects.all()
 
 
-class TagsField(serializers.PrimaryKeyRelatedField):
+class TagsField(serializers.PrimaryKeyRelatedField[Tag]):
     def get_queryset(self):
         return Tag.objects.all()
 
 
-class DocumentTypeField(serializers.PrimaryKeyRelatedField):
+class DocumentTypeField(serializers.PrimaryKeyRelatedField[DocumentType]):
     def get_queryset(self):
         return DocumentType.objects.all()
 
 
-class StoragePathField(serializers.PrimaryKeyRelatedField):
+class StoragePathField(serializers.PrimaryKeyRelatedField[StoragePath]):
     def get_queryset(self):
         return StoragePath.objects.all()
 
 
-class CustomFieldSerializer(serializers.ModelSerializer):
-    def __init__(self, *args, **kwargs) -> None:
-        context = kwargs.get("context")
-        self.api_version = int(
-            context.get("request").version
-            if context and context.get("request")
-            else settings.REST_FRAMEWORK["DEFAULT_VERSION"],
-        )
-        super().__init__(*args, **kwargs)
-
+class CustomFieldSerializer(serializers.ModelSerializer[CustomField]):
     data_type = serializers.ChoiceField(
         choices=CustomField.FieldDataType,
         read_only=False,
@@ -808,38 +849,6 @@ class CustomFieldSerializer(serializers.ModelSerializer):
             )
         return super().validate(attrs)
 
-    def to_internal_value(self, data):
-        ret = super().to_internal_value(data)
-
-        if (
-            self.api_version < 7
-            and ret.get("data_type", "") == CustomField.FieldDataType.SELECT
-            and isinstance(ret.get("extra_data", {}).get("select_options"), list)
-        ):
-            ret["extra_data"]["select_options"] = [
-                {
-                    "label": option,
-                    "id": get_random_string(length=16),
-                }
-                for option in ret["extra_data"]["select_options"]
-            ]
-
-        return ret
-
-    def to_representation(self, instance):
-        ret = super().to_representation(instance)
-
-        if (
-            self.api_version < 7
-            and instance.data_type == CustomField.FieldDataType.SELECT
-        ):
-            # Convert the select options with ids to a list of strings
-            ret["extra_data"]["select_options"] = [
-                option["label"] for option in ret["extra_data"]["select_options"]
-            ]
-
-        return ret
-
 
 class ReadWriteSerializerMethodField(serializers.SerializerMethodField):
     """
@@ -855,7 +864,26 @@ class ReadWriteSerializerMethodField(serializers.SerializerMethodField):
         return {self.field_name: data}
 
 
-class CustomFieldInstanceSerializer(serializers.ModelSerializer):
+def validate_documentlink_targets(user, doc_ids):
+    if Document.objects.filter(id__in=doc_ids).count() != len(doc_ids):
+        raise serializers.ValidationError(
+            "Some documents in value don't exist or were specified twice.",
+        )
+
+    if user is None:
+        return
+
+    if (
+        Document.objects.filter(id__in=doc_ids)
+        .exclude(id__in=permitted_document_ids(user, perm="change_document"))
+        .exists()
+    ):
+        raise PermissionDenied(
+            _("Insufficient permissions."),
+        )
+
+
+class CustomFieldInstanceSerializer(serializers.ModelSerializer[CustomFieldInstance]):
     field = serializers.PrimaryKeyRelatedField(queryset=CustomField.objects.all())
     value = ReadWriteSerializerMethodField(allow_null=True)
 
@@ -945,58 +973,15 @@ class CustomFieldInstanceSerializer(serializers.ModelSerializer):
                         "Value must be a list",
                     )
                 doc_ids = data["value"]
-                if Document.objects.filter(id__in=doc_ids).count() != len(
-                    data["value"],
-                ):
-                    raise serializers.ValidationError(
-                        "Some documents in value don't exist or were specified twice.",
-                    )
+                request = self.context.get("request")
+                validate_documentlink_targets(
+                    getattr(request, "user", None) if request is not None else None,
+                    doc_ids,
+                )
+            elif field.data_type == CustomField.FieldDataType.DATE:
+                data["value"] = serializers.DateField().to_internal_value(data["value"])
 
         return data
-
-    def get_api_version(self):
-        return int(
-            self.context.get("request").version
-            if self.context.get("request")
-            else settings.REST_FRAMEWORK["DEFAULT_VERSION"],
-        )
-
-    def to_internal_value(self, data):
-        ret = super().to_internal_value(data)
-
-        if (
-            self.get_api_version() < 7
-            and ret.get("field").data_type == CustomField.FieldDataType.SELECT
-            and ret.get("value") is not None
-        ):
-            # Convert the index of the option in the field.extra_data["select_options"]
-            # list to the options unique id
-            ret["value"] = ret.get("field").extra_data["select_options"][ret["value"]][
-                "id"
-            ]
-
-        return ret
-
-    def to_representation(self, instance):
-        ret = super().to_representation(instance)
-
-        if (
-            self.get_api_version() < 7
-            and instance.field.data_type == CustomField.FieldDataType.SELECT
-        ):
-            # return the index of the option in the field.extra_data["select_options"] list
-            ret["value"] = next(
-                (
-                    idx
-                    for idx, option in enumerate(
-                        instance.field.extra_data["select_options"],
-                    )
-                    if option["id"] == instance.value
-                ),
-                None,
-            )
-
-        return ret
 
     class Meta:
         model = CustomFieldInstance
@@ -1006,34 +991,20 @@ class CustomFieldInstanceSerializer(serializers.ModelSerializer):
         ]
 
 
-class BasicUserSerializer(serializers.ModelSerializer):
+class BasicUserSerializer(serializers.ModelSerializer[User]):
     # Different than paperless.serializers.UserSerializer
     class Meta:
         model = User
         fields = ["id", "username", "first_name", "last_name"]
 
 
-class NotesSerializer(serializers.ModelSerializer):
+class NotesSerializer(serializers.ModelSerializer[Note]):
     user = BasicUserSerializer(read_only=True)
 
     class Meta:
         model = Note
         fields = ["id", "note", "created", "user"]
         ordering = ["-created"]
-
-    def to_representation(self, instance):
-        ret = super().to_representation(instance)
-
-        request = self.context.get("request")
-        api_version = int(
-            request.version if request else settings.REST_FRAMEWORK["DEFAULT_VERSION"],
-        )
-
-        if api_version < 8 and "user" in ret:
-            user_id = ret["user"]["id"]
-            ret["user"] = user_id
-
-        return ret
 
 
 def _get_viewable_duplicates(
@@ -1046,20 +1017,32 @@ def _get_viewable_duplicates(
     duplicates = Document.global_objects.filter(
         Q(checksum__in=checksums) | Q(archive_checksum__in=checksums),
     ).exclude(pk=document.pk)
+    duplicates = duplicates.filter(root_document__isnull=True)
     duplicates = duplicates.order_by("-created")
-    allowed = get_objects_for_user_owner_aware(
-        user,
-        "documents.view_document",
-        Document,
-        include_deleted=True,
-    )
-    return duplicates.filter(id__in=allowed)
+    allowed_ids = permitted_document_ids(user, include_deleted=True)
+    return duplicates.filter(id__in=allowed_ids)
 
 
-class DuplicateDocumentSummarySerializer(serializers.Serializer):
+class DuplicateDocumentSummarySerializer(serializers.Serializer[dict[str, Any]]):
     id = serializers.IntegerField()
     title = serializers.CharField()
     deleted_at = serializers.DateTimeField(allow_null=True)
+
+
+class _DocumentVersionInfo(TypedDict):
+    id: int
+    added: datetime
+    version_label: str | None
+    checksum: str | None
+    is_root: bool
+
+
+class DocumentVersionInfoSerializer(serializers.Serializer[_DocumentVersionInfo]):
+    id = serializers.IntegerField()
+    added = serializers.DateTimeField()
+    version_label = serializers.CharField(required=False, allow_null=True)
+    checksum = serializers.CharField(required=False, allow_null=True)
+    is_root = serializers.BooleanField()
 
 
 @extend_schema_serializer(
@@ -1068,7 +1051,7 @@ class DuplicateDocumentSummarySerializer(serializers.Serializer):
 class DocumentSerializer(
     OwnedObjectSerializer,
     NestedUpdateMixin,
-    DynamicFieldsModelSerializer,
+    DocumentUpdateFieldsModelSerializer,
 ):
     correspondent = CorrespondentField(allow_null=True)
     tags = TagsField(many=True)
@@ -1082,6 +1065,10 @@ class DocumentSerializer(
     duplicate_documents = SerializerMethodField()
 
     notes = NotesSerializer(many=True, required=False, read_only=True)
+    root_document: RelatedField[Document, Document, Any] | ManyRelatedField = (
+        serializers.PrimaryKeyRelatedField(read_only=True)
+    )
+    versions = SerializerMethodField()
 
     custom_fields = CustomFieldInstanceSerializer(
         many=True,
@@ -1115,6 +1102,46 @@ class DocumentSerializer(
         duplicates = _get_viewable_duplicates(obj, user)
         return list(duplicates.values("id", "title", "deleted_at"))
 
+    @extend_schema_field(DocumentVersionInfoSerializer(many=True))
+    def get_versions(self, obj):
+        root_doc = obj if obj.root_document_id is None else obj.root_document
+        if root_doc is None:
+            return []
+
+        prefetched_cache = getattr(obj, "_prefetched_objects_cache", None)
+        prefetched_versions = (
+            prefetched_cache.get("versions")
+            if isinstance(prefetched_cache, dict)
+            else None
+        )
+
+        versions: list[Document]
+        if prefetched_versions is not None:
+            versions = [*prefetched_versions, root_doc]
+        else:
+            versions_qs = Document.objects.filter(root_document=root_doc).only(
+                "id",
+                "added",
+                "checksum",
+                "version_label",
+                "root_document_id",
+                "version_index",
+            )
+            versions = [*versions_qs, root_doc]
+
+        versions = sort_versions_newest_first(versions)
+
+        def build_info(doc: Document) -> _DocumentVersionInfo:
+            return {
+                "id": doc.id,
+                "added": doc.added,
+                "version_label": doc.version_label,
+                "checksum": doc.checksum,
+                "is_root": doc.id == root_doc.id,
+            }
+
+        return [build_info(doc) for doc in versions]
+
     def get_original_file_name(self, obj) -> str | None:
         return obj.original_filename
 
@@ -1126,24 +1153,16 @@ class DocumentSerializer(
 
     def to_representation(self, instance):
         doc = super().to_representation(instance)
+        if "content" in self.fields and has_prefetched_effective_content(instance):
+            # Only resolve version-aware content when it's cheap: an SQL
+            # annotation or a versions prefetch is already on the instance.
+            # A caller that set up neither (e.g. TrashView, GlobalSearchView,
+            # which build their own querysets) gets the document's own,
+            # unresolved content instead of paying for an extra per-instance
+            # query -- same as before effective_content resolution existed.
+            doc["content"] = instance.get_effective_content() or ""
         if self.truncate_content and "content" in self.fields:
             doc["content"] = doc.get("content")[0:550]
-
-        request = self.context.get("request")
-        api_version = int(
-            request.version if request else settings.REST_FRAMEWORK["DEFAULT_VERSION"],
-        )
-
-        if api_version < 9 and "created" in self.fields:
-            # provide created as a datetime for backwards compatibility
-            from django.utils import timezone
-
-            doc["created"] = timezone.make_aware(
-                datetime.combine(
-                    instance.created,
-                    datetime.min.time(),
-                ),
-            ).isoformat()
         return doc
 
     def to_internal_value(self, data):
@@ -1179,10 +1198,9 @@ class DocumentSerializer(
         return super().validate(attrs)
 
     def update(self, instance: Document, validated_data):
-        if "created_date" in validated_data and "created" not in validated_data:
-            instance.created = validated_data.get("created_date")
-            instance.save()
         if "created_date" in validated_data:
+            if "created" not in validated_data:
+                validated_data["created"] = validated_data["created_date"]
             logger.warning(
                 "created_date is deprecated, use created instead",
             )
@@ -1212,11 +1230,19 @@ class DocumentSerializer(
             prev_tags = set(instance.tags.all())
             requested_tags = set(validated_data["tags"])
 
-            # Tags being removed in this update and all descendants
+            # Tags newly added in this update and the ancestors they require
+            added_tags = requested_tags - prev_tags
+            required_by_add_tags = set(added_tags)
+            for t in added_tags:
+                required_by_add_tags.update(t.get_ancestors())
+
+            # Tags being removed in this update and all descendants, except
+            # those required by a tag that is being added in this same update
             removed_tags = prev_tags - requested_tags
             blocked_tags = set(removed_tags)
             for t in removed_tags:
                 blocked_tags.update(t.get_descendants())
+            blocked_tags.difference_update(required_by_add_tags)
 
             # Add all parent tags
             final_tags = set(requested_tags)
@@ -1228,35 +1254,38 @@ class DocumentSerializer(
 
             validated_data["tags"] = list(final_tags)
         if validated_data.get("remove_inbox_tags"):
-            tag_ids_being_added = (
-                [
-                    tag.id
-                    for tag in validated_data["tags"]
-                    if tag not in instance.tags.all()
-                ]
+            current_tag_ids = {t.pk for t in instance.tags.all()}
+            tags = (
+                validated_data["tags"]
                 if "tags" in validated_data
-                else []
+                else list(instance.tags.all())
             )
-            inbox_tags_not_being_added = Tag.objects.filter(is_inbox_tag=True).exclude(
-                id__in=tag_ids_being_added,
-            )
-            if "tags" in validated_data:
-                validated_data["tags"] = [
-                    tag
-                    for tag in validated_data["tags"]
-                    if tag not in inbox_tags_not_being_added
-                ]
-            else:
-                validated_data["tags"] = [
-                    tag
-                    for tag in instance.tags.all()
-                    if tag not in inbox_tags_not_being_added
-                ]
+
+            # Tags newly added in this update, plus their ancestors, are kept
+            keep_ids: set[int] = set()
+            for tag in tags:
+                if tag.pk not in current_tag_ids:
+                    keep_ids.add(tag.pk)
+                    keep_ids.update(int(pk) for pk in tag.get_ancestors_pks())
+
+            # Remove inbox tags and their descendants, except those being kept
+            remove_ids: set[int] = set()
+            for inbox_tag in (
+                Tag.objects.filter(is_inbox_tag=True)
+                .exclude(pk__in=keep_ids)
+                .only("pk", "tn_descendants_pks")
+            ):
+                remove_ids.add(inbox_tag.pk)
+                remove_ids.update(int(pk) for pk in inbox_tag.get_descendants_pks())
+
+            validated_data["tags"] = [t for t in tags if t.pk not in remove_ids]
+
         if settings.AUDIT_LOG_ENABLED:
             with set_actor(self.user):
                 super().update(instance, validated_data)
         else:
             super().update(instance, validated_data)
+
         # hard delete custom field instances that were soft deleted
         CustomFieldInstance.deleted_objects.filter(document=instance).delete()
         return instance
@@ -1303,11 +1332,14 @@ class DocumentSerializer(
             "remove_inbox_tags",
             "page_count",
             "mime_type",
+            "root_document",
+            "versions",
         )
+        read_only_fields = ("deleted_at",)
         list_serializer_class = OwnedObjectListSerializer
 
 
-class SearchResultListSerializer(serializers.ListSerializer):
+class SearchResultListSerializer(serializers.ListSerializer[Document]):
     def to_representation(self, hits):
         document_ids = [hit["id"] for hit in hits]
         # Fetch all Document objects in the list in one SQL query.
@@ -1344,22 +1376,18 @@ class SearchResultSerializer(DocumentSerializer):
         documents = self.context.get("documents")
         # Otherwise we fetch this document.
         if documents is None:  # pragma: no cover
-            # In practice we only serialize **lists** of whoosh.searching.Hit.
-            # I'm keeping this check for completeness but marking it no cover for now.
+            # In practice we only serialize **lists** of SearchHit dicts.
+            # Keeping this check for completeness but marking it no cover for now.
             documents = self.fetch_documents([hit["id"]])
         document = documents[hit["id"]]
 
-        notes = ",".join(
-            [str(c.note) for c in document.notes.all()],
-        )
+        highlights = hit.get("highlights", {})
         r = super().to_representation(document)
         r["__search_hit__"] = {
-            "score": hit.score,
-            "highlights": hit.highlights("content", text=document.content),
-            "note_highlights": (
-                hit.highlights("notes", text=notes) if document else None
-            ),
-            "rank": hit.rank,
+            "score": hit["score"],
+            "highlights": highlights.get("content", ""),
+            "note_highlights": highlights.get("notes") or None,
+            "rank": hit["rank"],
         }
 
         return r
@@ -1368,7 +1396,7 @@ class SearchResultSerializer(DocumentSerializer):
         list_serializer_class = SearchResultListSerializer
 
 
-class SavedViewFilterRuleSerializer(serializers.ModelSerializer):
+class SavedViewFilterRuleSerializer(serializers.ModelSerializer[SavedViewFilterRule]):
     class Meta:
         model = SavedViewFilterRule
         fields = ["rule_type", "value"]
@@ -1382,8 +1410,7 @@ class SavedViewSerializer(OwnedObjectSerializer):
         fields = [
             "id",
             "name",
-            "show_on_dashboard",
-            "show_in_sidebar",
+            "icon",
             "sort_field",
             "sort_reverse",
             "filter_rules",
@@ -1393,7 +1420,126 @@ class SavedViewSerializer(OwnedObjectSerializer):
             "owner",
             "permissions",
             "user_can_change",
+            "set_permissions",
         ]
+
+    def _get_api_version(self) -> int:
+        request = self.context.get("request")
+        return int(
+            request.version if request else settings.REST_FRAMEWORK["DEFAULT_VERSION"],
+        )
+
+    def _update_legacy_visibility_preferences(
+        self,
+        saved_view_id: int,
+        *,
+        show_on_dashboard: bool | None,
+        show_in_sidebar: bool | None,
+    ) -> UiSettings | None:
+        if show_on_dashboard is None and show_in_sidebar is None:
+            return None
+
+        request = self.context.get("request")
+        user = request.user if request else self.user
+        if user is None:
+            return None
+
+        ui_settings, _ = UiSettings.objects.get_or_create(
+            user=user,
+            defaults={"settings": {}},
+        )
+        current_settings = (
+            ui_settings.settings if isinstance(ui_settings.settings, dict) else {}
+        )
+        current_settings = dict(current_settings)
+
+        saved_views_settings = current_settings.get("saved_views")
+        if isinstance(saved_views_settings, dict):
+            saved_views_settings = dict(saved_views_settings)
+        else:
+            saved_views_settings = {}
+
+        dashboard_ids = {
+            int(raw_id)
+            for raw_id in saved_views_settings.get("dashboard_views_visible_ids", [])
+            if str(raw_id).isdigit()
+        }
+        sidebar_ids = {
+            int(raw_id)
+            for raw_id in saved_views_settings.get("sidebar_views_visible_ids", [])
+            if str(raw_id).isdigit()
+        }
+
+        if show_on_dashboard is not None:
+            if show_on_dashboard:
+                dashboard_ids.add(saved_view_id)
+            else:
+                dashboard_ids.discard(saved_view_id)
+        if show_in_sidebar is not None:
+            if show_in_sidebar:
+                sidebar_ids.add(saved_view_id)
+            else:
+                sidebar_ids.discard(saved_view_id)
+
+        saved_views_settings["dashboard_views_visible_ids"] = sorted(dashboard_ids)
+        saved_views_settings["sidebar_views_visible_ids"] = sorted(sidebar_ids)
+        current_settings["saved_views"] = saved_views_settings
+        ui_settings.settings = current_settings
+        ui_settings.save(update_fields=["settings"])
+        return ui_settings
+
+    def to_representation(self, instance):
+        # TODO: remove this and related backwards compatibility code when API v9 is dropped
+        ret = super().to_representation(instance)
+        request = self.context.get("request")
+        api_version = self._get_api_version()
+
+        if api_version < 10:
+            dashboard_ids = set()
+            sidebar_ids = set()
+            user = request.user if request else None
+            if user is not None and hasattr(user, "ui_settings"):
+                ui_settings = user.ui_settings.settings or None
+                saved_views = None
+                if isinstance(ui_settings, dict):
+                    saved_views = ui_settings.get("saved_views", {})
+                if isinstance(saved_views, dict):
+                    dashboard_ids = set(
+                        saved_views.get("dashboard_views_visible_ids", []),
+                    )
+                    sidebar_ids = set(
+                        saved_views.get("sidebar_views_visible_ids", []),
+                    )
+            ret["show_on_dashboard"] = instance.id in dashboard_ids
+            ret["show_in_sidebar"] = instance.id in sidebar_ids
+
+        return ret
+
+    def to_internal_value(self, data):
+        # TODO: remove this and related backwards compatibility code when API v9 is dropped
+        api_version = self._get_api_version()
+        if api_version >= 10:
+            return super().to_internal_value(data)
+
+        normalized_data = data.copy()
+        legacy_visibility_fields = {}
+        boolean_field = serializers.BooleanField()
+
+        for field_name in ("show_on_dashboard", "show_in_sidebar"):
+            if field_name in normalized_data:
+                try:
+                    legacy_visibility_fields[field_name] = (
+                        boolean_field.to_internal_value(
+                            normalized_data.get(field_name),
+                        )
+                    )
+                except serializers.ValidationError as exc:
+                    raise serializers.ValidationError({field_name: exc.detail})
+                del normalized_data[field_name]
+
+        ret = super().to_internal_value(normalized_data)
+        ret.update(legacy_visibility_fields)
+        return ret
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -1414,6 +1560,9 @@ class SavedViewSerializer(OwnedObjectSerializer):
         return attrs
 
     def update(self, instance, validated_data):
+        request = self.context.get("request")
+        show_on_dashboard = validated_data.pop("show_on_dashboard", None)
+        show_in_sidebar = validated_data.pop("show_in_sidebar", None)
         if "filter_rules" in validated_data:
             rules_data = validated_data.pop("filter_rules")
         else:
@@ -1430,25 +1579,42 @@ class SavedViewSerializer(OwnedObjectSerializer):
             and len(validated_data["display_fields"]) == 0
         ):
             validated_data["display_fields"] = None
-        super().update(instance, validated_data)
+        instance = super().update(instance, validated_data)
         if rules_data is not None:
             SavedViewFilterRule.objects.filter(saved_view=instance).delete()
             for rule_data in rules_data:
                 SavedViewFilterRule.objects.create(saved_view=instance, **rule_data)
+        ui_settings = self._update_legacy_visibility_preferences(
+            instance.id,
+            show_on_dashboard=show_on_dashboard,
+            show_in_sidebar=show_in_sidebar,
+        )
+        if request is not None and ui_settings is not None:
+            request.user.ui_settings = ui_settings
         return instance
 
     def create(self, validated_data):
+        request = self.context.get("request")
+        show_on_dashboard = validated_data.pop("show_on_dashboard", None)
+        show_in_sidebar = validated_data.pop("show_in_sidebar", None)
         rules_data = validated_data.pop("filter_rules")
         if "user" in validated_data:
             # backwards compatibility
             validated_data["owner"] = validated_data.pop("user")
-        saved_view = SavedView.objects.create(**validated_data)
+        saved_view = super().create(validated_data)
         for rule_data in rules_data:
             SavedViewFilterRule.objects.create(saved_view=saved_view, **rule_data)
+        ui_settings = self._update_legacy_visibility_preferences(
+            saved_view.id,
+            show_on_dashboard=show_on_dashboard,
+            show_in_sidebar=show_in_sidebar,
+        )
+        if request is not None and ui_settings is not None:
+            request.user.ui_settings = ui_settings
         return saved_view
 
 
-class DocumentListSerializer(serializers.Serializer):
+class DocumentListSerializer(serializers.Serializer[dict[str, list[int]]]):
     documents = serializers.ListField(
         required=True,
         label="Documents",
@@ -1472,11 +1638,209 @@ class DocumentListSerializer(serializers.Serializer):
         return documents
 
 
+class DocumentSelectionSerializer(DocumentListSerializer):
+    documents = serializers.ListField(
+        required=False,
+        label="Documents",
+        write_only=True,
+        child=serializers.IntegerField(),
+    )
+
+    all = serializers.BooleanField(
+        default=False,
+        required=False,
+        write_only=True,
+    )
+
+    filters = serializers.DictField(
+        required=False,
+        allow_empty=True,
+        write_only=True,
+    )
+
+    def validate(self, attrs):
+        if attrs.get("all", False):
+            attrs.setdefault("documents", [])
+            return attrs
+
+        if "documents" not in attrs:
+            raise serializers.ValidationError(
+                "documents is required unless all is true.",
+            )
+
+        documents = attrs["documents"]
+        self._validate_document_id_list(documents)
+        return attrs
+
+
+class SourceModeValidationMixin:
+    def validate_source_mode(self, source_mode: str) -> str:
+        if source_mode not in bulk_edit.SourceModeChoices.__dict__.values():
+            raise serializers.ValidationError("Invalid source_mode")
+        return source_mode
+
+
+class RotateDocumentsSerializer(DocumentSelectionSerializer, SourceModeValidationMixin):
+    degrees = serializers.IntegerField(required=True)
+    source_mode = serializers.CharField(
+        required=False,
+        default=bulk_edit.SourceModeChoices.LATEST_VERSION,
+    )
+    from_webui = serializers.BooleanField(required=False, default=False)
+
+
+class MergeDocumentsSerializer(DocumentListSerializer, SourceModeValidationMixin):
+    metadata_document_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+    )
+    delete_originals = serializers.BooleanField(required=False, default=False)
+    archive_fallback = serializers.BooleanField(required=False, default=False)
+    source_mode = serializers.CharField(
+        required=False,
+        default=bulk_edit.SourceModeChoices.LATEST_VERSION,
+    )
+    from_webui = serializers.BooleanField(required=False, default=False)
+
+
+class MergeDocumentsAsVersionsSerializer(DocumentListSerializer):
+    root_document_id = serializers.IntegerField(required=True)
+    version_label = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=64,
+    )
+
+    def validate_version_label(self, value):
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    def validate(self, attrs):
+        documents = attrs["documents"]
+        if len(documents) < 2:
+            raise serializers.ValidationError(
+                "At least two documents are required.",
+            )
+        if attrs.get("version_label") is not None and len(documents) != 2:
+            raise serializers.ValidationError(
+                "version_label can only be used when merging one source document.",
+            )
+        if attrs["root_document_id"] not in documents:
+            raise serializers.ValidationError(
+                "root_document_id must be one of the selected documents.",
+            )
+
+        selected_documents = Document.objects.filter(id__in=documents)
+        if selected_documents.filter(root_document__isnull=False).exists():
+            raise serializers.ValidationError(
+                "Only top-level documents can be merged as versions.",
+            )
+
+        source_document_ids = set(documents) - {attrs["root_document_id"]}
+        if Document.global_objects.filter(
+            root_document_id__in=source_document_ids,
+        ).exists():
+            raise serializers.ValidationError(
+                "Documents with existing versions cannot be merged into another document.",
+            )
+        return attrs
+
+
+class EditPdfDocumentsSerializer(DocumentListSerializer, SourceModeValidationMixin):
+    operations = serializers.ListField(required=True)
+    delete_original = serializers.BooleanField(required=False, default=False)
+    update_document = serializers.BooleanField(required=False, default=False)
+    include_metadata = serializers.BooleanField(required=False, default=True)
+    source_mode = serializers.CharField(
+        required=False,
+        default=bulk_edit.SourceModeChoices.LATEST_VERSION,
+    )
+    from_webui = serializers.BooleanField(required=False, default=False)
+
+    def validate(self, attrs):
+        documents = attrs["documents"]
+        if len(documents) > 1:
+            raise serializers.ValidationError(
+                "Edit PDF method only supports one document",
+            )
+
+        operations = attrs["operations"]
+        if not isinstance(operations, list):
+            raise serializers.ValidationError("operations must be a list")
+
+        for op in operations:
+            if not isinstance(op, dict):
+                raise serializers.ValidationError("invalid operation entry")
+            if "page" not in op or not isinstance(op["page"], int):
+                raise serializers.ValidationError("page must be an integer")
+            if "rotate" in op and not isinstance(op["rotate"], int):
+                raise serializers.ValidationError("rotate must be an integer")
+            if "doc" in op and not isinstance(op["doc"], int):
+                raise serializers.ValidationError("doc must be an integer")
+
+        if attrs["update_document"]:
+            max_idx = max(op.get("doc", 0) for op in operations)
+            if max_idx > 0:
+                raise serializers.ValidationError(
+                    "update_document only allowed with a single output document",
+                )
+
+        doc = Document.objects.get(id=documents[0])
+        if doc.page_count:
+            for op in operations:
+                if op["page"] < 1 or op["page"] > doc.page_count:
+                    raise serializers.ValidationError(
+                        f"Page {op['page']} is out of bounds for document with {doc.page_count} pages.",
+                    )
+        return attrs
+
+
+class RemovePasswordDocumentsSerializer(
+    DocumentListSerializer,
+    SourceModeValidationMixin,
+):
+    password = serializers.CharField(required=True)
+    update_document = serializers.BooleanField(required=False, default=False)
+    delete_original = serializers.BooleanField(required=False, default=False)
+    include_metadata = serializers.BooleanField(required=False, default=True)
+    source_mode = serializers.CharField(
+        required=False,
+        default=bulk_edit.SourceModeChoices.LATEST_VERSION,
+    )
+    from_webui = serializers.BooleanField(required=False, default=False)
+
+
+class DeleteDocumentsSerializer(DocumentSelectionSerializer):
+    pass
+
+
+class ReprocessDocumentsSerializer(DocumentSelectionSerializer):
+    remote_ocr = serializers.BooleanField(required=False, default=False)
+
+
 class BulkEditSerializer(
     SerializerWithPerms,
-    DocumentListSerializer,
+    DocumentSelectionSerializer,
     SetPermissionsMixin,
+    SourceModeValidationMixin,
 ):
+    # TODO: remove this and related backwards compatibility code when API v9 is dropped
+    # split, delete_pages can be removed entirely
+    MOVED_DOCUMENT_ACTION_ENDPOINTS = {
+        "delete": "/api/documents/delete/",
+        "reprocess": "/api/documents/reprocess/",
+        "rotate": "/api/documents/rotate/",
+        "merge": "/api/documents/merge/",
+        "edit_pdf": "/api/documents/edit_pdf/",
+        "remove_password": "/api/documents/remove_password/",
+        "split": "/api/documents/edit_pdf/",
+        "delete_pages": "/api/documents/edit_pdf/",
+    }
+    LEGACY_DOCUMENT_ACTION_METHODS = tuple(MOVED_DOCUMENT_ACTION_ENDPOINTS.keys())
+
     method = serializers.ChoiceField(
         choices=[
             "set_correspondent",
@@ -1486,21 +1850,15 @@ class BulkEditSerializer(
             "remove_tag",
             "modify_tags",
             "modify_custom_fields",
-            "delete",
-            "reprocess",
             "set_permissions",
-            "rotate",
-            "merge",
-            "split",
-            "delete_pages",
-            "edit_pdf",
-            "remove_password",
+            *LEGACY_DOCUMENT_ACTION_METHODS,
         ],
         label="Method",
         write_only=True,
     )
 
     parameters = serializers.DictField(allow_empty=True, default={}, write_only=True)
+    from_webui = serializers.BooleanField(required=False, default=False)
 
     def _validate_tag_id_list(self, tags, name="tags") -> None:
         if not isinstance(tags, list):
@@ -1539,6 +1897,28 @@ class BulkEditSerializer(
                 f"Some custom fields in {name} don't exist or were specified twice.",
             )
 
+    def _validate_custom_field_values(self, custom_fields, name):
+        if not isinstance(custom_fields, dict):
+            return custom_fields
+
+        validated = {}
+        errors = {}
+        for raw_field_id, value in custom_fields.items():
+            field_id = int(raw_field_id)
+            validator = CustomFieldInstanceSerializer(
+                data={"field": field_id, "value": value},
+                context=self.context,
+            )
+            if validator.is_valid():
+                validated[field_id] = validator.validated_data["value"]
+            else:
+                errors[str(field_id)] = validator.errors
+
+        if errors:
+            raise serializers.ValidationError({name: errors})
+
+        return validated
+
     def validate_method(self, method):
         if method == "set_correspondent":
             return bulk_edit.set_correspondent
@@ -1572,8 +1952,7 @@ class BulkEditSerializer(
             return bulk_edit.edit_pdf
         elif method == "remove_password":
             return bulk_edit.remove_password
-        else:  # pragma: no cover
-            # This will never happen as it is handled by the ChoiceField
+        else:
             raise serializers.ValidationError("Unsupported method.")
 
     def _validate_parameters_tags(self, parameters) -> None:
@@ -1642,6 +2021,10 @@ class BulkEditSerializer(
                 parameters["add_custom_fields"],
                 "add_custom_fields",
             )
+            parameters["add_custom_fields"] = self._validate_custom_field_values(
+                parameters["add_custom_fields"],
+                "add_custom_fields",
+            )
         else:
             raise serializers.ValidationError("add_custom_fields not specified")
 
@@ -1660,6 +2043,8 @@ class BulkEditSerializer(
         return ownerUser
 
     def _validate_parameters_set_permissions(self, parameters) -> None:
+        if "set_permissions" not in parameters:
+            raise serializers.ValidationError("set_permissions not specified")
         parameters["set_permissions"] = self.validate_set_permissions(
             parameters["set_permissions"],
         )
@@ -1677,6 +2062,13 @@ class BulkEditSerializer(
                 raise serializers.ValidationError("invalid rotation degrees")
         except ValueError:
             raise serializers.ValidationError("invalid rotation degrees")
+
+    def _validate_source_mode(self, parameters) -> None:
+        source_mode = parameters.get(
+            "source_mode",
+            bulk_edit.SourceModeChoices.LATEST_VERSION,
+        )
+        parameters["source_mode"] = self.validate_source_mode(source_mode)
 
     def _validate_parameters_split(self, parameters) -> None:
         if "pages" not in parameters:
@@ -1768,6 +2160,13 @@ class BulkEditSerializer(
                         f"Page {op['page']} is out of bounds for document with {doc.page_count} pages.",
                     )
 
+    def _validate_parameters_reprocess(self, parameters) -> None:
+        if "remote_ocr" in parameters:
+            if not isinstance(parameters["remote_ocr"], bool):
+                raise serializers.ValidationError("remote_ocr must be a boolean")
+        else:
+            parameters["remote_ocr"] = False
+
     def validate_parameters_remove_password(self, parameters):
         if "password" not in parameters:
             raise serializers.ValidationError("password not specified")
@@ -1775,8 +2174,24 @@ class BulkEditSerializer(
             raise serializers.ValidationError("password must be a string")
 
     def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        if attrs.get("all", False) and attrs["method"] in [
+            bulk_edit.merge,
+            bulk_edit.split,
+            bulk_edit.delete_pages,
+            bulk_edit.edit_pdf,
+            bulk_edit.remove_password,
+        ]:
+            raise serializers.ValidationError(
+                "This method does not support all=true.",
+            )
+
         method = attrs["method"]
         parameters = attrs["parameters"]
+
+        if "source_mode" in parameters:
+            self._validate_source_mode(parameters)
 
         if method == bulk_edit.set_correspondent:
             self._validate_parameters_correspondent(parameters)
@@ -1816,11 +2231,13 @@ class BulkEditSerializer(
             self._validate_parameters_edit_pdf(parameters, attrs["documents"][0])
         elif method == bulk_edit.remove_password:
             self.validate_parameters_remove_password(parameters)
+        elif method == bulk_edit.reprocess:
+            self._validate_parameters_reprocess(parameters)
 
         return attrs
 
 
-class PostDocumentSerializer(serializers.Serializer):
+class PostDocumentSerializer(serializers.Serializer[dict[str, Any]]):
     created = serializers.DateTimeField(
         label="Created",
         allow_null=True,
@@ -1997,7 +2414,39 @@ class PostDocumentSerializer(serializers.Serializer):
             return created.date()
 
 
-class BulkDownloadSerializer(DocumentListSerializer):
+class DocumentVersionSerializer(serializers.Serializer[dict[str, Any]]):
+    document = serializers.FileField(
+        label="Document",
+        write_only=True,
+    )
+    version_label = serializers.CharField(
+        label="Version label",
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=64,
+    )
+
+    validate_document = PostDocumentSerializer().validate_document
+
+
+class DocumentVersionLabelSerializer(serializers.Serializer[dict[str, str | None]]):
+    version_label = serializers.CharField(
+        label="Version label",
+        required=True,
+        allow_blank=True,
+        allow_null=True,
+        max_length=64,
+    )
+
+    def validate_version_label(self, value):
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class BulkDownloadSerializer(DocumentSelectionSerializer):
     content = serializers.ChoiceField(
         choices=["archive", "originals", "both"],
         default="archive",
@@ -2106,12 +2555,15 @@ class StoragePathSerializer(MatchingModelSerializer, OwnedObjectSerializer):
         """
         doc_ids = [doc.id for doc in instance.documents.all()]
         if doc_ids:
-            bulk_edit.bulk_update_documents.delay(doc_ids)
+            bulk_edit.bulk_update_documents.apply_async(
+                kwargs={"document_ids": doc_ids},
+                headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+            )
 
         return super().update(instance, validated_data)
 
 
-class UiSettingsViewSerializer(serializers.ModelSerializer):
+class UiSettingsViewSerializer(serializers.ModelSerializer[UiSettings]):
     settings = serializers.DictField(required=False, allow_null=True)
 
     class Meta:
@@ -2139,7 +2591,79 @@ class UiSettingsViewSerializer(serializers.ModelSerializer):
         return ui_settings
 
 
-class TasksViewSerializer(OwnedObjectSerializer):
+class TaskSerializerV10(OwnedObjectSerializer):
+    """Task serializer for API v10+ using new field names."""
+
+    related_document_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        read_only=True,
+    )
+    task_type_display = serializers.CharField(
+        source="get_task_type_display",
+        read_only=True,
+    )
+    trigger_source_display = serializers.CharField(
+        source="get_trigger_source_display",
+        read_only=True,
+    )
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
+    )
+
+    class Meta:
+        model = PaperlessTask
+        fields = (
+            "id",
+            "task_id",
+            "task_type",
+            "task_type_display",
+            "trigger_source",
+            "trigger_source_display",
+            "status",
+            "status_display",
+            "date_created",
+            "date_started",
+            "date_done",
+            "duration_seconds",
+            "wait_time_seconds",
+            "input_data",
+            "result_data",
+            "related_document_ids",
+            "acknowledged",
+            "owner",
+        )
+        read_only_fields = fields
+
+
+class TaskSerializerV9(serializers.ModelSerializer[PaperlessTask]):
+    """Task serializer for API v9 backwards compatibility.
+
+    Maps old field names to the new model fields so existing clients continue
+    to work unchanged.
+    """
+
+    # v9 field: task_name -> task_type (with value remapping for renamed tasks)
+    task_name = serializers.SerializerMethodField()
+
+    # v9 field: task_file_name -> input_data.filename
+    task_file_name = serializers.SerializerMethodField()
+
+    # v9 field: type -> trigger_source (mapped to old enum labels)
+    type = serializers.SerializerMethodField()
+
+    # v9 field: status -> uppercase Celery state strings
+    status = serializers.SerializerMethodField()
+
+    # v9 field: result -> derived from result_data
+    result = serializers.SerializerMethodField()
+
+    # v9 field: related_document -> first document ID from result_data
+    related_document = serializers.SerializerMethodField()
+
+    # v9 field: duplicate_documents -> list of duplicate IDs from result_data
+    duplicate_documents = serializers.SerializerMethodField()
+
     class Meta:
         model = PaperlessTask
         fields = (
@@ -2147,69 +2671,124 @@ class TasksViewSerializer(OwnedObjectSerializer):
             "task_id",
             "task_name",
             "task_file_name",
-            "date_created",
-            "date_done",
             "type",
             "status",
+            "date_created",
+            "date_done",
             "result",
             "acknowledged",
             "related_document",
             "duplicate_documents",
             "owner",
         )
+        read_only_fields = fields
 
-    related_document = serializers.SerializerMethodField()
-    duplicate_documents = serializers.SerializerMethodField()
-    created_doc_re = re.compile(r"New document id (\d+) created")
-    duplicate_doc_re = re.compile(r"It is a duplicate of .* \(#(\d+)\)")
+    _TASK_TYPE_TO_V9_NAME = {
+        PaperlessTask.TaskType.SANITY_CHECK: "check_sanity",
+        PaperlessTask.TaskType.LLM_INDEX: "llmindex_update",
+    }
 
-    def get_related_document(self, obj) -> str | None:
-        result = None
-        re = None
-        if obj.result:
-            match obj.status:
-                case states.SUCCESS:
-                    re = self.created_doc_re
-                case states.FAILURE:
-                    re = (
-                        self.duplicate_doc_re
-                        if "existing document is in the trash" not in obj.result
-                        else None
-                    )
-            if re is not None:
-                try:
-                    result = re.search(obj.result).group(1)
-                except Exception:
-                    pass
+    def get_result(self, obj: PaperlessTask) -> str | None:
+        """Reconstruct a human-readable result string from result_data for v9 clients."""
+        if not obj.result_data:
+            return None
+        if doc_id := obj.result_data.get("document_id"):
+            return f"Success. New document id {doc_id} created"
+        if reason := obj.result_data.get("reason"):
+            return reason
+        if dup_id := obj.result_data.get("duplicate_of"):
+            return f"Not consuming: It is a duplicate of document #{dup_id}"
+        if error := obj.result_data.get("error_message"):
+            return error
+        return None
 
-        return result
+    def get_task_name(self, obj: PaperlessTask) -> str:
+        return self._TASK_TYPE_TO_V9_NAME.get(obj.task_type, obj.task_type)
 
-    @extend_schema_field(DuplicateDocumentSummarySerializer(many=True))
-    def get_duplicate_documents(self, obj):
-        related_document = self.get_related_document(obj)
-        request = self.context.get("request")
-        user = request.user if request else None
-        document = Document.global_objects.filter(pk=related_document).first()
-        if not related_document or not user or not document:
+    def get_task_file_name(self, obj: PaperlessTask) -> str | None:
+        if not obj.input_data:
+            return None
+        return obj.input_data.get("filename")
+
+    _STATUS_TO_V9 = {
+        PaperlessTask.Status.PENDING: "PENDING",
+        PaperlessTask.Status.STARTED: "STARTED",
+        PaperlessTask.Status.SUCCESS: "SUCCESS",
+        PaperlessTask.Status.FAILURE: "FAILURE",
+        PaperlessTask.Status.REVOKED: "REVOKED",
+    }
+
+    def get_status(self, obj: PaperlessTask) -> str:
+        return self._STATUS_TO_V9.get(obj.status, obj.status.upper())
+
+    _TRIGGER_SOURCE_TO_V9_TYPE = {
+        PaperlessTask.TriggerSource.SCHEDULED: "scheduled_task",
+        PaperlessTask.TriggerSource.SYSTEM: "auto_task",
+        # Email and folder-consumer documents are system-initiated, not manually triggered
+        PaperlessTask.TriggerSource.EMAIL_CONSUME: "auto_task",
+        PaperlessTask.TriggerSource.FOLDER_CONSUME: "auto_task",
+    }
+
+    def get_type(self, obj: PaperlessTask) -> str:
+        return self._TRIGGER_SOURCE_TO_V9_TYPE.get(obj.trigger_source, "manual_task")
+
+    def get_related_document(self, obj: PaperlessTask) -> int | None:
+        ids = obj.related_document_ids
+        return ids[0] if ids else None
+
+    def get_duplicate_documents(
+        self,
+        obj: PaperlessTask,
+    ) -> list[dict[str, Any]]:
+        if not obj.result_data:
             return []
-        duplicates = _get_viewable_duplicates(document, user)
-        return list(duplicates.values("id", "title", "deleted_at"))
+        dup_of = obj.result_data.get("duplicate_of")
+        if dup_of is None:
+            return []
+        request = self.context.get("request")
+        if request is None:
+            return []
+        user = request.user
+        qs = Document.global_objects.filter(pk=dup_of)
+        if not user.is_staff:
+            allowed_ids = permitted_document_ids(user, include_deleted=True)
+            qs = qs.filter(pk__in=allowed_ids)
+        return list(qs.values("id", "title", "deleted_at"))
 
 
-class RunTaskViewSerializer(serializers.Serializer):
-    task_name = serializers.ChoiceField(
-        choices=PaperlessTask.TaskName.choices,
-        label="Task Name",
+class TaskSummarySerializer(serializers.Serializer[dict[str, Any]]):
+    task_type = serializers.CharField()
+    total_count = serializers.IntegerField()
+    pending_count = serializers.IntegerField()
+    success_count = serializers.IntegerField()
+    failure_count = serializers.IntegerField()
+    avg_duration_seconds = serializers.FloatField(allow_null=True)
+    avg_wait_time_seconds = serializers.FloatField(allow_null=True)
+    last_run = serializers.DateTimeField(allow_null=True)
+    last_success = serializers.DateTimeField(allow_null=True)
+    last_failure = serializers.DateTimeField(allow_null=True)
+
+
+class RunTaskSerializer(serializers.Serializer[dict[str, str]]):
+    task_type = serializers.ChoiceField(
+        choices=PaperlessTask.TaskType.choices,
+        label="Task Type",
         write_only=True,
     )
 
 
-class AcknowledgeTasksViewSerializer(serializers.Serializer):
+class AcknowledgeTasksViewSerializer(serializers.Serializer[dict[str, Any]]):
     tasks = serializers.ListField(
-        required=True,
+        required=False,
         label="Tasks",
         write_only=True,
         child=serializers.IntegerField(),
+    )
+    all = serializers.BooleanField(
+        required=False,
+        default=False,
+        label="All",
+        write_only=True,
     )
 
     def _validate_task_id_list(self, tasks, name="tasks") -> None:
@@ -2217,7 +2796,8 @@ class AcknowledgeTasksViewSerializer(serializers.Serializer):
             raise serializers.ValidationError(f"{name} must be a list")
         if not all(isinstance(i, int) for i in tasks):
             raise serializers.ValidationError(f"{name} must be a list of integers")
-        count = PaperlessTask.objects.filter(id__in=tasks).count()
+        queryset = self.context.get("queryset", PaperlessTask.objects.all())
+        count = queryset.filter(id__in=tasks).count()
         if not count == len(tasks):
             raise serializers.ValidationError(
                 f"Some tasks in {name} don't exist or were specified twice.",
@@ -2226,6 +2806,21 @@ class AcknowledgeTasksViewSerializer(serializers.Serializer):
     def validate_tasks(self, tasks):
         self._validate_task_id_list(tasks)
         return tasks
+
+    def validate(self, attrs):
+        acknowledge_all = attrs.get("all", False)
+        task_ids = attrs.get("tasks")
+
+        if acknowledge_all and task_ids is not None:
+            raise serializers.ValidationError(
+                "Set either all or tasks, not both.",
+            )
+        if not acknowledge_all and task_ids is None:
+            raise serializers.ValidationError(
+                "Either all must be true or tasks must be provided.",
+            )
+
+        return attrs
 
 
 class ShareLinkSerializer(OwnedObjectSerializer):
@@ -2243,6 +2838,21 @@ class ShareLinkSerializer(OwnedObjectSerializer):
     def create(self, validated_data):
         validated_data["slug"] = get_random_string(50)
         return super().create(validated_data)
+
+    def validate_document(self, document):
+        if (
+            self.user is not None
+            and self.user.has_perm("documents.view_document")
+            and has_perms_owner_aware(
+                self.user,
+                "view_document",
+                document,
+            )
+        ):
+            return document
+        raise PermissionDenied(
+            _("Insufficient permissions."),
+        )
 
 
 class ShareLinkBundleSerializer(OwnedObjectSerializer):
@@ -2345,11 +2955,23 @@ class ShareLinkBundleSerializer(OwnedObjectSerializer):
 
 class BulkEditObjectsSerializer(SerializerWithPerms, SetPermissionsMixin):
     objects = serializers.ListField(
-        required=True,
-        allow_empty=False,
+        required=False,
+        allow_empty=True,
         label="Objects",
         write_only=True,
         child=serializers.IntegerField(),
+    )
+
+    all = serializers.BooleanField(
+        default=False,
+        required=False,
+        write_only=True,
+    )
+
+    filters = serializers.DictField(
+        required=False,
+        allow_empty=True,
+        write_only=True,
     )
 
     object_type = serializers.ChoiceField(
@@ -2424,10 +3046,20 @@ class BulkEditObjectsSerializer(SerializerWithPerms, SetPermissionsMixin):
 
     def validate(self, attrs):
         object_type = attrs["object_type"]
-        objects = attrs["objects"]
+        objects = attrs.get("objects")
+        apply_to_all = attrs.get("all", False)
         operation = attrs.get("operation")
 
-        self._validate_objects(objects, object_type)
+        if apply_to_all:
+            attrs.setdefault("objects", [])
+        else:
+            if objects is None:
+                raise serializers.ValidationError(
+                    "objects is required unless all is true.",
+                )
+            if len(objects) == 0:
+                raise serializers.ValidationError("objects must not be empty")
+            self._validate_objects(objects, object_type)
 
         if operation == "set_permissions":
             permissions = attrs.get("permissions")
@@ -2437,7 +3069,7 @@ class BulkEditObjectsSerializer(SerializerWithPerms, SetPermissionsMixin):
         return attrs
 
 
-class WorkflowTriggerSerializer(serializers.ModelSerializer):
+class WorkflowTriggerSerializer(serializers.ModelSerializer[WorkflowTrigger]):
     id = serializers.IntegerField(required=False, allow_null=True)
     sources = fields.MultipleChoiceField(
         choices=WorkflowTrigger.DocumentSourceChoices.choices,
@@ -2547,7 +3179,7 @@ class WorkflowTriggerSerializer(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 
 
-class WorkflowActionEmailSerializer(serializers.ModelSerializer):
+class WorkflowActionEmailSerializer(serializers.ModelSerializer[WorkflowActionEmail]):
     id = serializers.IntegerField(allow_null=True, required=False)
 
     class Meta:
@@ -2561,7 +3193,9 @@ class WorkflowActionEmailSerializer(serializers.ModelSerializer):
         ]
 
 
-class WorkflowActionWebhookSerializer(serializers.ModelSerializer):
+class WorkflowActionWebhookSerializer(
+    serializers.ModelSerializer[WorkflowActionWebhook],
+):
     id = serializers.IntegerField(allow_null=True, required=False)
 
     def validate_url(self, url):
@@ -2582,7 +3216,7 @@ class WorkflowActionWebhookSerializer(serializers.ModelSerializer):
         ]
 
 
-class WorkflowActionSerializer(serializers.ModelSerializer):
+class WorkflowActionSerializer(serializers.ModelSerializer[WorkflowAction]):
     id = serializers.IntegerField(required=False, allow_null=True)
     assign_correspondent = CorrespondentField(allow_null=True, required=False)
     assign_tags = TagsField(many=True, allow_null=True, required=False)
@@ -2628,6 +3262,9 @@ class WorkflowActionSerializer(serializers.ModelSerializer):
             "email",
             "webhook",
             "passwords",
+            "ai_suggestion_fields",
+            "ai_create_missing",
+            "ai_overwrite_existing",
         ]
 
     def validate(self, attrs):
@@ -2637,34 +3274,18 @@ class WorkflowActionSerializer(serializers.ModelSerializer):
                 attrs["assign_title"] = None
             else:
                 try:
-                    # test against all placeholders, see consumer.py `parse_doc_title_w_placeholders`
-                    attrs["assign_title"].format(
-                        correspondent="",
-                        document_type="",
-                        added="",
-                        added_year="",
-                        added_year_short="",
-                        added_month="",
-                        added_month_name="",
-                        added_month_name_short="",
-                        added_day="",
-                        added_time="",
-                        owner_username="",
-                        original_filename="",
-                        filename="",
-                        created="",
-                        created_year="",
-                        created_year_short="",
-                        created_month="",
-                        created_month_name="",
-                        created_month_name_short="",
-                        created_day="",
-                        created_time="",
-                    )
+                    validate_workflow_template(attrs["assign_title"])
                 except (ValueError, KeyError) as e:
                     raise serializers.ValidationError(
-                        {"assign_title": f'Invalid f-string detected: "{e.args[0]}"'},
+                        {"assign_title": f"{e.args[0]}"},
                     )
+
+        if attrs.get("assign_custom_fields_values"):
+            # Empty strings treated as None to avoid unexpected behavior
+            attrs["assign_custom_fields_values"] = {
+                field_id: (None if value == "" else value)
+                for field_id, value in attrs["assign_custom_fields_values"].items()
+            }
 
         if (
             "type" in attrs
@@ -2701,10 +3322,27 @@ class WorkflowActionSerializer(serializers.ModelSerializer):
                     "Passwords are required for password removal actions",
                 )
 
+        if (
+            "type" in attrs
+            and attrs["type"] == WorkflowAction.WorkflowActionType.APPLY_AI_SUGGESTIONS
+        ):
+            fields = attrs.get("ai_suggestion_fields")
+            valid_fields = set(WorkflowAction.AISuggestionField.values)
+            if (
+                fields is None
+                or not isinstance(fields, list)
+                or len(fields) == 0
+                or any(field not in valid_fields for field in fields)
+            ):
+                raise serializers.ValidationError(
+                    "At least one valid field is required for apply AI "
+                    f"suggestions actions, options are: {sorted(valid_fields)}",
+                )
+
         return attrs
 
 
-class WorkflowSerializer(serializers.ModelSerializer):
+class WorkflowSerializer(serializers.ModelSerializer[Workflow]):
     order = serializers.IntegerField(required=False)
 
     triggers = WorkflowTriggerSerializer(many=True)
@@ -2720,6 +3358,68 @@ class WorkflowSerializer(serializers.ModelSerializer):
             "triggers",
             "actions",
         ]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        if "actions" in attrs:
+            has_remote_ocr_action = any(
+                action.get("type") == WorkflowAction.WorkflowActionType.REMOTE_OCR
+                for action in attrs["actions"]
+            )
+            has_ai_suggestions_action = any(
+                action.get("type")
+                == WorkflowAction.WorkflowActionType.APPLY_AI_SUGGESTIONS
+                for action in attrs["actions"]
+            )
+        else:
+            has_remote_ocr_action = self.instance is not None and (
+                self.instance.actions.filter(
+                    type=WorkflowAction.WorkflowActionType.REMOTE_OCR,
+                ).exists()
+            )
+            has_ai_suggestions_action = self.instance is not None and (
+                self.instance.actions.filter(
+                    type=WorkflowAction.WorkflowActionType.APPLY_AI_SUGGESTIONS,
+                ).exists()
+            )
+
+        if "triggers" in attrs:
+            has_consumption_trigger = any(
+                trigger.get("type") == WorkflowTrigger.WorkflowTriggerType.CONSUMPTION
+                for trigger in attrs["triggers"]
+            )
+            has_non_consumption_trigger = any(
+                trigger.get("type") != WorkflowTrigger.WorkflowTriggerType.CONSUMPTION
+                for trigger in attrs["triggers"]
+            )
+        else:
+            has_consumption_trigger = self.instance is not None and (
+                self.instance.triggers.filter(
+                    type=WorkflowTrigger.WorkflowTriggerType.CONSUMPTION,
+                ).exists()
+            )
+            has_non_consumption_trigger = self.instance is not None and (
+                self.instance.triggers.exclude(
+                    type=WorkflowTrigger.WorkflowTriggerType.CONSUMPTION,
+                ).exists()
+            )
+
+        # Remote OCR can only work with consumption triggers
+        if has_remote_ocr_action and not has_consumption_trigger:
+            raise serializers.ValidationError(
+                "Remote OCR actions require a consumption started trigger",
+            )
+
+        # Suggestions are made from the document content, which does not exist
+        # until after consumption has finished
+        if has_ai_suggestions_action and not has_non_consumption_trigger:
+            raise serializers.ValidationError(
+                "Apply AI suggestions actions require a trigger other than "
+                "consumption started",
+            )
+
+        return attrs
 
     def update_triggers_and_actions(
         self,
@@ -2891,13 +3591,13 @@ class WorkflowSerializer(serializers.ModelSerializer):
         ManyToMany fields dont support e.g. on_delete so we need to discard unattached
         triggers and actions manually
         """
-        for trigger in WorkflowTrigger.objects.all():
-            if trigger.workflows.all().count() == 0:
-                trigger.delete()
+        WorkflowTrigger.objects.annotate(
+            workflow_count=Count("workflows"),
+        ).filter(workflow_count=0).delete()
 
-        for action in WorkflowAction.objects.all():
-            if action.workflows.all().count() == 0:
-                action.delete()
+        WorkflowAction.objects.annotate(
+            workflow_count=Count("workflows"),
+        ).filter(workflow_count=0).delete()
 
         WorkflowActionEmail.objects.filter(action=None).delete()
         WorkflowActionWebhook.objects.filter(action=None).delete()
@@ -2908,6 +3608,8 @@ class WorkflowSerializer(serializers.ModelSerializer):
 
         if "actions" in validated_data:
             actions = validated_data.pop("actions")
+            for action in actions:
+                action.pop("id", None)
 
         instance = super().create(validated_data)
 
@@ -2926,16 +3628,6 @@ class WorkflowSerializer(serializers.ModelSerializer):
 
         return instance
 
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        actions = instance.actions.order_by("order", "pk")
-        data["actions"] = WorkflowActionSerializer(
-            actions,
-            many=True,
-            context=self.context,
-        ).data
-        return data
-
 
 class TrashSerializer(SerializerWithPerms):
     documents = serializers.ListField(
@@ -2951,7 +3643,7 @@ class TrashSerializer(SerializerWithPerms):
         write_only=True,
     )
 
-    def validate_documents(self, documents):
+    def validate_documents(self, documents: list[int]) -> list[int]:
         count = Document.deleted_objects.filter(id__in=documents).count()
         if not count == len(documents):
             raise serializers.ValidationError(
@@ -2968,8 +3660,20 @@ class StoragePathTestSerializer(SerializerWithPerms):
     )
 
     document = serializers.PrimaryKeyRelatedField(
-        queryset=Document.objects.all(),
+        queryset=Document.objects.none(),
         required=True,
         label="Document",
         write_only=True,
     )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if user is not None and user.is_authenticated:
+            document_field = self.fields.get("document")
+            if not isinstance(document_field, serializers.PrimaryKeyRelatedField):
+                return
+            document_field.queryset = Document.objects.filter(
+                id__in=permitted_document_ids(user),
+            )

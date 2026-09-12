@@ -16,6 +16,9 @@ from guardian.core import ObjectPermissionChecker
 
 from documents.barcodes import BarcodePlugin
 from documents.consumer import ConsumerError
+from documents.consumer import ConsumerPlugin
+from documents.consumer import ConsumerPreflightPlugin
+from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
 from documents.data_models import DocumentSource
 from documents.models import Correspondent
@@ -24,81 +27,126 @@ from documents.models import Document
 from documents.models import DocumentType
 from documents.models import StoragePath
 from documents.models import Tag
-from documents.parsers import DocumentParser
 from documents.parsers import ParseError
 from documents.plugins.helpers import ProgressStatusOptions
 from documents.tasks import sanity_check
 from documents.tests.utils import DirectoriesMixin
+from documents.tests.utils import DummyProgressManager
 from documents.tests.utils import FileSystemAssertsMixin
 from documents.tests.utils import GetConsumerMixin
 from paperless_mail.models import MailRule
-from paperless_mail.parsers import MailDocumentParser
 
 
-class _BaseTestParser(DocumentParser):
-    def get_settings(self) -> None:
+class _BaseNewStyleParser:
+    """Minimal ParserProtocol implementation for use in consumer tests."""
+
+    name: str = "test-parser"
+    version: str = "0.1"
+    author: str = "test"
+    url: str = "test"
+
+    @classmethod
+    def supported_mime_types(cls) -> dict:
+        return {
+            "application/pdf": ".pdf",
+            "image/png": ".png",
+            "message/rfc822": ".eml",
+        }
+
+    @classmethod
+    def score(cls, mime_type: str, filename: str, path=None):
+        return 0 if mime_type in cls.supported_mime_types() else None
+
+    @property
+    def can_produce_archive(self) -> bool:
+        return True
+
+    @property
+    def requires_pdf_rendition(self) -> bool:
+        return False
+
+    def __init__(self) -> None:
+        self._tmpdir: Path | None = None
+        self._text: str | None = None
+        self._archive: Path | None = None
+        self._thumb: Path | None = None
+
+    def __enter__(self):
+        self._tmpdir = Path(
+            tempfile.mkdtemp(prefix="paperless-test-", dir=settings.SCRATCH_DIR),
+        )
+        _, thumb = tempfile.mkstemp(suffix=".webp", dir=self._tmpdir)
+        self._thumb = Path(thumb)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._tmpdir and self._tmpdir.exists():
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def configure(self, context) -> None:
         """
-        This parser does not implement additional settings yet
+        Test parser doesn't do anything with context
         """
+
+    def parse(self, document_path, mime_type, *, produce_archive: bool = True) -> None:
+        raise NotImplementedError
+
+    def get_text(self) -> str | None:
+        return self._text
+
+    def get_date(self):
         return None
 
+    def get_archive_path(self):
+        return self._archive
 
-class DummyParser(_BaseTestParser):
-    def __init__(self, logging_group, scratch_dir, archive_path) -> None:
-        super().__init__(logging_group, None)
-        _, self.fake_thumb = tempfile.mkstemp(suffix=".webp", dir=scratch_dir)
-        self.archive_path = archive_path
+    def get_thumbnail(self, document_path, mime_type) -> Path:
+        return self._thumb
 
-    def get_thumbnail(self, document_path, mime_type, file_name=None):
-        return self.fake_thumb
+    def get_page_count(self, document_path, mime_type):
+        return None
 
-    def parse(self, document_path, mime_type, file_name=None) -> None:
-        self.text = "The Text"
-
-
-class CopyParser(_BaseTestParser):
-    def get_thumbnail(self, document_path, mime_type, file_name=None):
-        return self.fake_thumb
-
-    def __init__(self, logging_group, progress_callback=None) -> None:
-        super().__init__(logging_group, progress_callback)
-        _, self.fake_thumb = tempfile.mkstemp(suffix=".webp", dir=self.tempdir)
-
-    def parse(self, document_path, mime_type, file_name=None) -> None:
-        self.text = "The text"
-        self.archive_path = Path(self.tempdir / "archive.pdf")
-        shutil.copy(document_path, self.archive_path)
+    def extract_metadata(self, document_path, mime_type) -> list:
+        return []
 
 
-class FaultyParser(_BaseTestParser):
-    def __init__(self, logging_group, scratch_dir) -> None:
-        super().__init__(logging_group)
-        _, self.fake_thumb = tempfile.mkstemp(suffix=".webp", dir=scratch_dir)
+class DummyParser(_BaseNewStyleParser):
+    _ARCHIVE_SRC = (
+        Path(__file__).parent / "samples" / "documents" / "archive" / "0000001.pdf"
+    )
 
-    def get_thumbnail(self, document_path, mime_type, file_name=None):
-        return self.fake_thumb
+    def parse(self, document_path, mime_type, *, produce_archive: bool = True) -> None:
+        self._text = "The Text"
+        if produce_archive and self._tmpdir:
+            self._archive = self._tmpdir / "archive.pdf"
+            shutil.copy(self._ARCHIVE_SRC, self._archive)
 
-    def parse(self, document_path, mime_type, file_name=None):
+
+class CopyParser(_BaseNewStyleParser):
+    def parse(self, document_path, mime_type, *, produce_archive: bool = True) -> None:
+        self._text = "The text"
+        if produce_archive and self._tmpdir:
+            self._archive = self._tmpdir / "archive.pdf"
+            shutil.copy(document_path, self._archive)
+
+
+class FaultyParser(_BaseNewStyleParser):
+    def parse(self, document_path, mime_type, *, produce_archive: bool = True) -> None:
         raise ParseError("Does not compute.")
 
 
-class FaultyGenericExceptionParser(_BaseTestParser):
-    def __init__(self, logging_group, scratch_dir) -> None:
-        super().__init__(logging_group)
-        _, self.fake_thumb = tempfile.mkstemp(suffix=".webp", dir=scratch_dir)
-
-    def get_thumbnail(self, document_path, mime_type, file_name=None):
-        return self.fake_thumb
-
-    def parse(self, document_path, mime_type, file_name=None):
+class FaultyGenericExceptionParser(_BaseNewStyleParser):
+    def parse(self, document_path, mime_type, *, produce_archive: bool = True) -> None:
         raise Exception("Generic exception.")
 
 
-def fake_magic_from_file(file, *, mime=False):
+def fake_magic_from_file(file, *, mime=False):  # NOSONAR
     if mime:
         filepath = Path(file)
         if filepath.name.startswith("invalid_pdf"):
             return "application/octet-stream"
+        if filepath.name.startswith("valid_pdf"):
+            return "application/pdf"
         if filepath.suffix == ".pdf":
             return "application/pdf"
         elif filepath.suffix == ".png":
@@ -142,38 +190,12 @@ class TestConsumer(
         self.assertEqual(payload["data"]["max_progress"], last_progress_max)
         self.assertEqual(payload["data"]["status"], last_status)
 
-    def make_dummy_parser(self, logging_group, progress_callback=None):
-        return DummyParser(
-            logging_group,
-            self.dirs.scratch_dir,
-            self.get_test_archive_file(),
-        )
-
-    def make_faulty_parser(self, logging_group, progress_callback=None):
-        return FaultyParser(logging_group, self.dirs.scratch_dir)
-
-    def make_faulty_generic_exception_parser(
-        self,
-        logging_group,
-        progress_callback=None,
-    ):
-        return FaultyGenericExceptionParser(logging_group, self.dirs.scratch_dir)
-
     def setUp(self) -> None:
         super().setUp()
 
-        patcher = mock.patch("documents.parsers.document_consumer_declaration.send")
-        m = patcher.start()
-        m.return_value = [
-            (
-                None,
-                {
-                    "parser": self.make_dummy_parser,
-                    "mime_types": {"application/pdf": ".pdf"},
-                    "weight": 0,
-                },
-            ),
-        ]
+        patcher = mock.patch("documents.consumer.get_parser_registry")
+        mock_registry = patcher.start()
+        mock_registry.return_value.get_parser_for_file.return_value = DummyParser
         self.addCleanup(patcher.stop)
 
     def get_test_file(self):
@@ -208,7 +230,11 @@ class TestConsumer(
         shutil.copy(src, dst)
         return dst
 
-    @override_settings(FILENAME_FORMAT=None, TIME_ZONE="America/Chicago")
+    @override_settings(
+        FILENAME_FORMAT=None,
+        TIME_ZONE="America/Chicago",
+        ARCHIVE_FILE_GENERATION="always",
+    )
     def testNormalOperation(self) -> None:
         filename = self.get_test_file()
 
@@ -220,6 +246,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertIsNotNone(document)
 
@@ -239,8 +266,14 @@ class TestConsumer(
 
         self.assertIsFile(document.archive_path)
 
-        self.assertEqual(document.checksum, "42995833e01aea9b3edee44bbfdd7ce1")
-        self.assertEqual(document.archive_checksum, "62acb0bcbfbcaa62ca6ad3668e4e404b")
+        self.assertEqual(
+            document.checksum,
+            "1093cf6e32adbd16b06969df09215d42c4a3a8938cc18b39455953f08d1ff2ab",
+        )
+        self.assertEqual(
+            document.archive_checksum,
+            "706124ecde3c31616992fa979caed17a726b1c9ccdba70e82a4ff796cea97ccf",
+        )
 
         self.assertIsNotFile(filename)
 
@@ -265,6 +298,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertIsNotNone(document)
 
@@ -284,6 +318,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertIsNotNone(document)
 
@@ -299,6 +334,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertIsNotNone(document)
 
@@ -315,6 +351,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertIsNotNone(document)
 
@@ -331,6 +368,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(document.document_type.id, dt.id)
         self._assert_first_last_send_progress()
@@ -345,6 +383,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(document.storage_path.id, sp.id)
         self._assert_first_last_send_progress()
@@ -361,6 +400,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertIn(t1, document.tags.all())
         self.assertNotIn(t2, document.tags.all())
@@ -387,6 +427,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         fields_used = [
             field_instance.field for field_instance in document.custom_fields.all()
@@ -409,6 +450,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(document.archive_serial_number, 123)
         self._assert_first_last_send_progress()
@@ -428,6 +470,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         now = timezone.now()
         self.assertEqual(document.title, f"{c.name}{dt.name} {now.strftime('%m-%y')}")
@@ -443,6 +486,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(document.owner, testuser)
         self._assert_first_last_send_progress()
@@ -461,6 +505,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         user_checker = ObjectPermissionChecker(testuser)
         self.assertTrue(user_checker.has_perm("view_document", document))
@@ -533,6 +578,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
             document.delete()
 
         with self.assertRaisesMessage(ConsumerError, "document is in the trash"):
@@ -542,9 +588,9 @@ class TestConsumer(
             ) as consumer:
                 consumer.run()
 
-    @mock.patch("documents.parsers.document_consumer_declaration.send")
+    @mock.patch("documents.consumer.get_parser_registry")
     def testNoParsers(self, m) -> None:
-        m.return_value = []
+        m.return_value.get_parser_for_file.return_value = None
 
         with self.assertRaisesMessage(
             ConsumerError,
@@ -555,18 +601,9 @@ class TestConsumer(
 
         self._assert_first_last_send_progress(last_status="FAILED")
 
-    @mock.patch("documents.parsers.document_consumer_declaration.send")
+    @mock.patch("documents.consumer.get_parser_registry")
     def testFaultyParser(self, m) -> None:
-        m.return_value = [
-            (
-                None,
-                {
-                    "parser": self.make_faulty_parser,
-                    "mime_types": {"application/pdf": ".pdf"},
-                    "weight": 0,
-                },
-            ),
-        ]
+        m.return_value.get_parser_for_file.return_value = FaultyParser
 
         with self.get_consumer(self.get_test_file()) as consumer:
             with self.assertRaisesMessage(
@@ -577,18 +614,9 @@ class TestConsumer(
 
         self._assert_first_last_send_progress(last_status="FAILED")
 
-    @mock.patch("documents.parsers.document_consumer_declaration.send")
+    @mock.patch("documents.consumer.get_parser_registry")
     def testGenericParserException(self, m) -> None:
-        m.return_value = [
-            (
-                None,
-                {
-                    "parser": self.make_faulty_generic_exception_parser,
-                    "mime_types": {"application/pdf": ".pdf"},
-                    "weight": 0,
-                },
-            ),
-        ]
+        m.return_value.get_parser_for_file.return_value = FaultyGenericExceptionParser
 
         with self.get_consumer(self.get_test_file()) as consumer:
             with self.assertRaisesMessage(
@@ -619,7 +647,10 @@ class TestConsumer(
         # Database empty
         self.assertEqual(Document.objects.all().count(), 0)
 
-    @override_settings(FILENAME_FORMAT="{correspondent}/{title}")
+    @override_settings(
+        FILENAME_FORMAT="{correspondent}/{title}",
+        ARCHIVE_FILE_GENERATION="always",
+    )
     def testFilenameHandling(self) -> None:
         with self.get_consumer(
             self.get_test_file(),
@@ -628,6 +659,7 @@ class TestConsumer(
             consumer.run()
 
         document = Document.objects.first()
+        assert document is not None
 
         self.assertEqual(document.title, "new docs")
         self.assertEqual(document.filename, "none/new docs.pdf")
@@ -635,7 +667,39 @@ class TestConsumer(
 
         self._assert_first_last_send_progress()
 
-    @override_settings(FILENAME_FORMAT="{correspondent}/{title}")
+    @mock.patch("documents.consumer.generate_unique_filename")
+    @override_settings(FILENAME_FORMAT="{pk}", ARCHIVE_FILE_GENERATION="always")
+    def testFilenameHandlingFallsBackWhenGeneratedPathExceedsDbLimit(self, m):
+        m.side_effect = lambda doc, archive_filename=False: Path(
+            ("a" * 1100 + ".pdf") if not archive_filename else ("b" * 1100 + ".pdf"),
+        )
+
+        with self.get_consumer(
+            self.get_test_file(),
+            DocumentMetadataOverrides(title="new docs"),
+        ) as consumer:
+            consumer.run()
+
+        document = Document.objects.first()
+        assert document is not None
+        self.assertIsNotNone(document)
+        assert document is not None
+
+        self.assertEqual(document.filename, f"{document.pk:07d}.pdf")
+        self.assertLessEqual(len(document.filename), 1024)
+        self.assertLessEqual(
+            len(document.archive_filename),
+            1024,
+        )
+        self.assertIsFile(document.source_path)
+        self.assertIsFile(document.archive_path)
+
+        self._assert_first_last_send_progress()
+
+    @override_settings(
+        FILENAME_FORMAT="{correspondent}/{title}",
+        ARCHIVE_FILE_GENERATION="always",
+    )
     @mock.patch("documents.signals.handlers.generate_unique_filename")
     def testFilenameHandlingUnstableFormat(self, m) -> None:
         filenames = ["this", "that", "now this", "i cannot decide"]
@@ -656,6 +720,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(document.title, "new docs")
         self.assertIsNotNone(document.title)
@@ -663,6 +728,217 @@ class TestConsumer(
         self.assertIsFile(document.archive_path)
 
         self._assert_first_last_send_progress()
+
+    @mock.patch("documents.consumer.load_classifier")
+    def test_version_label_override_applies(self, m) -> None:
+        m.return_value = MagicMock()
+
+        with self.get_consumer(
+            self.get_test_file(),
+            DocumentMetadataOverrides(version_label="v1"),
+        ) as consumer:
+            consumer.run()
+
+        document = Document.objects.first()
+        assert document is not None
+        assert document is not None
+
+        self.assertEqual(document.version_label, "v1")
+
+        self._assert_first_last_send_progress()
+
+    @override_settings(AUDIT_LOG_ENABLED=True)
+    @mock.patch("documents.consumer.load_classifier")
+    def test_consume_version_creates_new_version(self, m) -> None:
+        m.return_value = MagicMock()
+
+        with self.get_consumer(self.get_test_file()) as consumer:
+            consumer.run()
+
+        root_doc = Document.objects.first()
+        self.assertIsNotNone(root_doc)
+        assert root_doc is not None
+
+        root_storage_path = StoragePath.objects.create(
+            name="version-root-path",
+            path="root/{{title}}",
+        )
+        root_doc.storage_path = root_storage_path
+        root_doc.archive_serial_number = 42
+        root_doc.save()
+
+        original_modified = timezone.now() - datetime.timedelta(days=1)
+        Document.objects.filter(pk=root_doc.pk).update(modified=original_modified)
+        actor = User.objects.create_user(
+            username="actor",
+            email="actor@example.com",
+            password="password",
+        )
+
+        version_file = self.get_test_file2()
+        status = DummyProgressManager(version_file.name, None)
+        overrides = DocumentMetadataOverrides(
+            version_label="v2",
+            actor_id=actor.pk,
+        )
+        doc = ConsumableDocument(
+            DocumentSource.ApiUpload,
+            original_file=version_file,
+            root_document_id=root_doc.pk,
+        )
+        preflight = ConsumerPreflightPlugin(
+            doc,
+            overrides,
+            status,  # type: ignore[arg-type]
+            self.dirs.scratch_dir,
+            "task-id",
+        )
+        preflight.setup()
+        preflight.run()
+
+        consumer = ConsumerPlugin(
+            doc,
+            overrides,
+            status,  # type: ignore[arg-type]
+            self.dirs.scratch_dir,
+            "task-id",
+        )
+        consumer.setup()
+        try:
+            self.assertEqual(consumer.filename, version_file.name)
+            consumer.run()
+        finally:
+            consumer.cleanup()
+
+        versions = Document.objects.filter(root_document=root_doc)
+        self.assertEqual(versions.count(), 1)
+        version = versions.first()
+        assert version is not None
+        assert version.original_filename is not None
+        self.assertEqual(version.version_index, 1)
+        self.assertEqual(version.version_label, "v2")
+        self.assertIsNone(version.archive_serial_number)
+        self.assertEqual(version.original_filename, version_file.name)
+        self.assertTrue(bool(version.content))
+        root_doc.refresh_from_db()
+        self.assertGreater(root_doc.modified, original_modified)
+
+    @override_settings(AUDIT_LOG_ENABLED=True)
+    @mock.patch("documents.consumer.load_classifier")
+    def test_consume_version_with_missing_actor_and_filename_without_suffix(
+        self,
+        m: mock.Mock,
+    ) -> None:
+        m.return_value = MagicMock()
+
+        with self.get_consumer(self.get_test_file()) as consumer:
+            consumer.run()
+
+        root_doc = Document.objects.first()
+        self.assertIsNotNone(root_doc)
+        assert root_doc is not None
+
+        version_file = self.get_test_file2()
+        status = DummyProgressManager(version_file.name, None)
+        overrides = DocumentMetadataOverrides(
+            filename="valid_pdf_version-upload",
+            actor_id=999999,
+        )
+        doc = ConsumableDocument(
+            DocumentSource.ApiUpload,
+            original_file=version_file,
+            root_document_id=root_doc.pk,
+        )
+
+        preflight = ConsumerPreflightPlugin(
+            doc,
+            overrides,
+            status,  # type: ignore[arg-type]
+            self.dirs.scratch_dir,
+            "task-id",
+        )
+        preflight.setup()
+        preflight.run()
+
+        consumer = ConsumerPlugin(
+            doc,
+            overrides,
+            status,  # type: ignore[arg-type]
+            self.dirs.scratch_dir,
+            "task-id",
+        )
+        consumer.setup()
+        try:
+            self.assertEqual(consumer.filename, "valid_pdf_version-upload")
+            consumer.run()
+        finally:
+            consumer.cleanup()
+
+        version = (
+            Document.objects.filter(root_document=root_doc).order_by("-id").first()
+        )
+        self.assertIsNotNone(version)
+        assert version is not None
+        self.assertEqual(version.version_index, 1)
+        self.assertEqual(version.original_filename, "valid_pdf_version-upload")
+        self.assertTrue(bool(version.content))
+
+    @override_settings(AUDIT_LOG_ENABLED=True)
+    @mock.patch("documents.consumer.load_classifier")
+    def test_consume_version_index_monotonic_after_version_deletion(self, m) -> None:
+        m.return_value = MagicMock()
+
+        with self.get_consumer(self.get_test_file()) as consumer:
+            consumer.run()
+
+        root_doc = Document.objects.first()
+        self.assertIsNotNone(root_doc)
+        assert root_doc is not None
+
+        def consume_version(version_file: Path) -> Document:
+            status = DummyProgressManager(version_file.name, None)
+            overrides = DocumentMetadataOverrides()
+            doc = ConsumableDocument(
+                DocumentSource.ApiUpload,
+                original_file=version_file,
+                root_document_id=root_doc.pk,
+            )
+            preflight = ConsumerPreflightPlugin(
+                doc,
+                overrides,
+                status,  # type: ignore[arg-type]
+                self.dirs.scratch_dir,
+                "task-id",
+            )
+            preflight.setup()
+            preflight.run()
+
+            consumer = ConsumerPlugin(
+                doc,
+                overrides,
+                status,  # type: ignore[arg-type]
+                self.dirs.scratch_dir,
+                "task-id",
+            )
+            consumer.setup()
+            try:
+                consumer.run()
+            finally:
+                consumer.cleanup()
+
+            version = (
+                Document.objects.filter(root_document=root_doc).order_by("-id").first()
+            )
+            assert version is not None
+            return version
+
+        v1 = consume_version(self.get_test_file2())
+        self.assertEqual(v1.version_index, 1)
+        v1.delete()
+
+        # The next version should have version_index 2, even though version_index 1 was deleted
+        v2 = consume_version(self.get_test_file())
+        self.assertEqual(v2.version_index, 2)
 
     @mock.patch("documents.consumer.load_classifier")
     def testClassifyDocument(self, m) -> None:
@@ -686,6 +962,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(document.correspondent, correspondent)
         self.assertEqual(document.document_type, dtype)
@@ -703,6 +980,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self._assert_first_last_send_progress()
 
@@ -733,6 +1011,7 @@ class TestConsumer(
 
         # Move the existing document to trash
         document = Document.objects.first()
+        assert document is not None
         document.delete()
 
         dst = self.get_test_file()
@@ -761,6 +1040,7 @@ class TestConsumer(
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self._assert_first_last_send_progress()
 
@@ -777,8 +1057,8 @@ class TestConsumer(
         self.assertEqual(Document.objects.count(), 2)
         self._assert_first_last_send_progress()
 
-    @override_settings(FILENAME_FORMAT="{title}")
-    @mock.patch("documents.parsers.document_consumer_declaration.send")
+    @override_settings(FILENAME_FORMAT="{title}", ARCHIVE_FILE_GENERATION="always")
+    @mock.patch("documents.consumer.get_parser_registry")
     def test_similar_filenames(self, m) -> None:
         shutil.copy(
             Path(__file__).parent / "samples" / "simple.pdf",
@@ -792,16 +1072,7 @@ class TestConsumer(
             Path(__file__).parent / "samples" / "simple-noalpha.png",
             settings.CONSUMPTION_DIR / "simple.png.pdf",
         )
-        m.return_value = [
-            (
-                None,
-                {
-                    "parser": CopyParser,
-                    "mime_types": {"application/pdf": ".pdf", "image/png": ".png"},
-                    "weight": 0,
-                },
-            ),
-        ]
+        m.return_value.get_parser_for_file.return_value = CopyParser
 
         with self.get_consumer(settings.CONSUMPTION_DIR / "simple.png") as consumer:
             consumer.run()
@@ -829,8 +1100,10 @@ class TestConsumer(
 
         sanity_check()
 
+    @mock.patch("documents.consumer.get_parser_registry")
     @mock.patch("documents.consumer.run_subprocess")
-    def test_try_to_clean_invalid_pdf(self, m) -> None:
+    def test_try_to_clean_invalid_pdf(self, m, mock_registry) -> None:
+        mock_registry.return_value.get_parser_for_file.return_value = None
         shutil.copy(
             Path(__file__).parent / "samples" / "invalid_pdf.pdf",
             settings.CONSUMPTION_DIR / "invalid_pdf.pdf",
@@ -851,12 +1124,14 @@ class TestConsumer(
             self.assertEqual(command[1], "--replace-input")
 
     @mock.patch("paperless_mail.models.MailRule.objects.get")
-    @mock.patch("paperless_mail.parsers.MailDocumentParser.parse")
-    @mock.patch("documents.parsers.document_consumer_declaration.send")
+    @mock.patch("paperless.parsers.mail.MailDocumentParser.get_thumbnail")
+    @mock.patch("paperless.parsers.mail.MailDocumentParser.parse")
+    @mock.patch("documents.consumer.get_parser_registry")
     def test_mail_parser_receives_mailrule(
         self,
-        mock_consumer_declaration_send: mock.Mock,
+        mock_get_parser_registry: mock.Mock,
         mock_mail_parser_parse: mock.Mock,
+        mock_get_thumbnail: mock.Mock,
         mock_mailrule_get: mock.Mock,
     ) -> None:
         """
@@ -867,41 +1142,65 @@ class TestConsumer(
         THEN:
             - The mail parser should receive the mail rule
         """
-        mock_consumer_declaration_send.return_value = [
-            (
-                None,
-                {
-                    "parser": MailDocumentParser,
-                    "mime_types": {"message/rfc822": ".eml"},
-                    "weight": 0,
-                },
-            ),
-        ]
+        from documents.parsers import ParseError
+        from paperless.parsers.mail import MailDocumentParser
+
+        mock_get_parser_registry.return_value.get_parser_for_file.return_value = (
+            MailDocumentParser
+        )
         mock_mailrule_get.return_value = mock.Mock(
             pdf_layout=MailRule.PdfLayout.HTML_ONLY,
         )
+        mock_get_thumbnail.side_effect = ParseError("no thumbnail")
+
+        src = (
+            Path(__file__).parent.parent.parent
+            / Path("paperless")
+            / Path("tests")
+            / Path("samples")
+            / Path("mail")
+            / "html.eml"
+        )
+        dst = self.dirs.scratch_dir / "html.eml"
+        shutil.copy(src, dst)
+
         with self.get_consumer(
-            filepath=(
-                Path(__file__).parent.parent.parent
-                / Path("paperless_mail")
-                / Path("tests")
-                / Path("samples")
-            ).resolve()
-            / "html.eml",
+            filepath=dst,
             source=DocumentSource.MailFetch,
             mailrule_id=1,
         ) as consumer:
-            # fails because no gotenberg
             with self.assertRaises(
                 ConsumerError,
             ):
                 consumer.run()
-                mock_mail_parser_parse.assert_called_once_with(
-                    consumer.working_copy,
-                    "message/rfc822",
-                    file_name="sample.pdf",
-                    mailrule=mock_mailrule_get.return_value,
-                )
+            mock_mail_parser_parse.assert_called_once_with(
+                consumer.working_copy,
+                "message/rfc822",
+                produce_archive=True,
+            )
+
+    @mock.patch("documents.consumer.generate_unique_filename")
+    def test_consume_refuses_to_write_outside_originals_dir(
+        self,
+        m: mock.Mock,
+    ) -> None:
+        """
+        GIVEN:
+            - Filename generation produces a path outside of the originals directory
+        WHEN:
+            - The document is consumed
+        THEN:
+            - The consumption fails and no file is written outside of the root
+        """
+        m.return_value = Path("../../pwned.pdf")
+        escaped = (settings.ORIGINALS_DIR / ".." / ".." / "pwned.pdf").resolve()
+
+        with self.get_consumer(self.get_test_file()) as consumer:
+            with self.assertRaises(ConsumerError):
+                consumer.run()
+
+        self.assertIsNotFile(escaped)
+        self.assertEqual(Document.objects.count(), 0)
 
 
 @mock.patch("documents.consumer.magic.from_file", fake_magic_from_file)
@@ -931,6 +1230,7 @@ class TestConsumerCreatedDate(DirectoriesMixin, GetConsumerMixin, TestCase):
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(
             document.created,
@@ -961,6 +1261,7 @@ class TestConsumerCreatedDate(DirectoriesMixin, GetConsumerMixin, TestCase):
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(
             document.created,
@@ -991,6 +1292,7 @@ class TestConsumerCreatedDate(DirectoriesMixin, GetConsumerMixin, TestCase):
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(
             document.created,
@@ -1023,6 +1325,7 @@ class TestConsumerCreatedDate(DirectoriesMixin, GetConsumerMixin, TestCase):
             consumer.run()
 
             document = Document.objects.first()
+            assert document is not None
 
         self.assertEqual(
             document.created,
@@ -1048,7 +1351,14 @@ class PreConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
     def test_no_pre_consume_script(self, m) -> None:
         with self.get_consumer(self.test_file) as c:
             c.run()
-            m.assert_not_called()
+            # Verify no pre-consume script subprocess was invoked
+            # (run_subprocess may still be called by pdf_born_digital_text via pdftotext)
+            script_calls = [
+                call
+                for call in m.call_args_list
+                if call.args and call.args[0] and call.args[0][0] not in ("pdftotext",)
+            ]
+            self.assertEqual(script_calls, [])
 
     @mock.patch("documents.consumer.run_subprocess")
     @override_settings(PRE_CONSUME_SCRIPT="does-not-exist")
@@ -1064,15 +1374,22 @@ class PreConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
                 with self.get_consumer(self.test_file) as c:
                     c.run()
 
-                    m.assert_called_once()
+                    self.assertTrue(m.called)
 
-                    args, _ = m.call_args
+                    # Find the call that invoked the pre-consume script
+                    # (run_subprocess may also be called by pdf_born_digital_text via pdftotext)
+                    script_call = next(
+                        call
+                        for call in m.call_args_list
+                        if call.args and call.args[0] and call.args[0][0] == script.name
+                    )
+                    args, _ = script_call
 
                     command = args[0]
                     environment = args[1]
 
                     self.assertEqual(command[0], script.name)
-                    self.assertEqual(command[1], str(self.test_file))
+                    self.assertEqual(len(command), 1)
 
                     subset = {
                         "DOCUMENT_SOURCE_PATH": str(c.input_doc.original_file),
@@ -1179,7 +1496,7 @@ class PostConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
                 consumer.run_post_consume_script(doc)
 
     @mock.patch("documents.consumer.run_subprocess")
-    def test_post_consume_script_simple(self, m) -> None:
+    def test_post_consume_script_simple(self, m: mock.MagicMock) -> None:
         with tempfile.NamedTemporaryFile() as script:
             with override_settings(POST_CONSUME_SCRIPT=script.name):
                 doc = Document.objects.create(title="Test", mime_type="application/pdf")
@@ -1190,7 +1507,10 @@ class PostConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
                 m.assert_called_once()
 
     @mock.patch("documents.consumer.run_subprocess")
-    def test_post_consume_script_with_correspondent_and_type(self, m) -> None:
+    def test_post_consume_script_with_correspondent_and_type(
+        self,
+        m: mock.MagicMock,
+    ) -> None:
         with tempfile.NamedTemporaryFile() as script:
             with override_settings(POST_CONSUME_SCRIPT=script.name):
                 c = Correspondent.objects.create(name="my_bank")
@@ -1219,11 +1539,7 @@ class PostConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
                 environment = args[1]
 
                 self.assertEqual(command[0], script.name)
-                self.assertEqual(command[1], str(doc.pk))
-                self.assertEqual(command[5], f"/api/documents/{doc.pk}/download/")
-                self.assertEqual(command[6], f"/api/documents/{doc.pk}/thumb/")
-                self.assertEqual(command[7], "my_bank")
-                self.assertCountEqual(command[8].split(","), ["a", "b"])
+                self.assertEqual(len(command), 1)
 
                 subset = {
                     "DOCUMENT_ID": str(doc.pk),
@@ -1266,12 +1582,105 @@ class PostConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
                         consumer.run_post_consume_script(doc)
 
 
+class TestConsumerRemoteOCR(
+    DirectoriesMixin,
+    FileSystemAssertsMixin,
+    GetConsumerMixin,
+    TestCase,
+):
+    """
+    The consumer resolves the remote OCR mode and the per-document request from
+    workflows into the allow_remote flag it hands to the parser registry.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+
+        patcher = mock.patch("documents.consumer.get_parser_registry")
+        self.mock_registry = patcher.start()
+        self.mock_registry.return_value.get_parser_for_file.return_value = DummyParser
+        self.addCleanup(patcher.stop)
+
+    def _consume(self, *, overrides: DocumentMetadataOverrides | None = None) -> bool:
+        src = (
+            Path(__file__).parent
+            / "samples"
+            / "documents"
+            / "originals"
+            / "0000001.pdf"
+        )
+        dst = self.dirs.scratch_dir / "sample.pdf"
+        shutil.copy(src, dst)
+
+        with self.get_consumer(dst, overrides=overrides) as consumer:
+            consumer.run()
+
+        _, kwargs = self.mock_registry.return_value.get_parser_for_file.call_args
+        return kwargs["allow_remote"]
+
+    @override_settings(REMOTE_OCR_MODE="always")
+    def test_always_mode_allows_remote(self) -> None:
+        """
+        GIVEN: Remote OCR mode is 'always'.
+        WHEN:  A document is consumed without any workflow asking for it.
+        THEN:  The registry is allowed to pick the remote parser.
+        """
+        self.assertTrue(self._consume())
+
+    @override_settings(REMOTE_OCR_MODE="workflow_only")
+    def test_workflow_only_mode_denies_remote_by_default(self) -> None:
+        """
+        GIVEN: Remote OCR mode is 'workflow_only'.
+        WHEN:  A document is consumed and nothing asked for remote OCR.
+        THEN:  The remote parser is excluded.
+        """
+        self.assertFalse(self._consume())
+
+    @override_settings(REMOTE_OCR_MODE="workflow_only")
+    def test_workflow_only_mode_allows_remote_when_requested(self) -> None:
+        """
+        GIVEN: Remote OCR mode is 'workflow_only'.
+        WHEN:  A workflow set remote_ocr on the metadata overrides.
+        THEN:  The registry is allowed to pick the remote parser.
+        """
+        self.assertTrue(
+            self._consume(overrides=DocumentMetadataOverrides(remote_ocr=True)),
+        )
+
+
 class TestMetadataOverrides(TestCase):
     def test_update_skip_asn_if_exists(self) -> None:
         base = DocumentMetadataOverrides()
         incoming = DocumentMetadataOverrides(skip_asn_if_exists=True)
         base.update(incoming)
         self.assertTrue(base.skip_asn_if_exists)
+
+    def test_update_remote_ocr(self) -> None:
+        base = DocumentMetadataOverrides()
+        base.update(DocumentMetadataOverrides(remote_ocr=True))
+        self.assertTrue(base.remote_ocr)
+
+    def test_update_remote_ocr_is_not_unset(self) -> None:
+        """
+        A later workflow that says nothing must not undo an earlier one that
+        asked for remote OCR.
+        """
+        base = DocumentMetadataOverrides(remote_ocr=True)
+        base.update(DocumentMetadataOverrides())
+        self.assertTrue(base.remote_ocr)
+
+    def test_update_actor_and_version_label(self) -> None:
+        base = DocumentMetadataOverrides(
+            actor_id=1,
+            version_label="root",
+        )
+        incoming = DocumentMetadataOverrides(
+            actor_id=2,
+            version_label="v2",
+        )
+        base.update(incoming)
+        self.assertEqual(base.actor_id, 2)
+        self.assertEqual(base.version_label, "v2")
 
 
 class TestBarcodeApplyDetectedASN(TestCase):

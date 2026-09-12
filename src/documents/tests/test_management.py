@@ -1,14 +1,21 @@
+from __future__ import annotations
+
 import filecmp
 import shutil
 from io import StringIO
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest import mock
 
+import pytest
 from auditlog.models import LogEntry
 from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
 from django.test import TestCase
 from django.test import override_settings
+
+if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
 
 from documents.file_handling import generate_filename
 from documents.models import Document
@@ -19,7 +26,11 @@ from documents.tests.utils import FileSystemAssertsMixin
 sample_file: Path = Path(__file__).parent / "samples" / "simple.pdf"
 
 
-@override_settings(FILENAME_FORMAT="{correspondent}/{title}")
+@pytest.mark.management
+@override_settings(
+    FILENAME_FORMAT="{correspondent}/{title}",
+    ARCHIVE_FILE_GENERATION="always",
+)
 class TestArchiver(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
     def make_models(self):
         return Document.objects.create(
@@ -33,7 +44,7 @@ class TestArchiver(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
         doc = self.make_models()
         shutil.copy(sample_file, Path(self.dirs.originals_dir) / f"{doc.id:07}.pdf")
 
-        call_command("document_archiver", "--processes", "1")
+        call_command("document_archiver", "--processes", "1", skip_checks=True)
 
     def test_handle_document(self) -> None:
         doc = self.make_models()
@@ -94,18 +105,108 @@ class TestArchiver(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
         self.assertEqual(doc2.archive_filename, "document_01.pdf")
 
 
-class TestMakeIndex(TestCase):
-    @mock.patch("documents.management.commands.document_index.index_reindex")
-    def test_reindex(self, m) -> None:
-        call_command("document_index", "reindex")
-        m.assert_called_once()
+@pytest.mark.management
+@pytest.mark.django_db
+class TestMakeIndex:
+    def test_reindex(self, mocker: MockerFixture) -> None:
+        """Reindex command must call the backend rebuild method to recreate the index."""
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command("document_index", "reindex", skip_checks=True)
+        mock_get_backend.return_value.rebuild.assert_called_once()
 
-    @mock.patch("documents.management.commands.document_index.index_optimize")
-    def test_optimize(self, m) -> None:
-        call_command("document_index", "optimize")
-        m.assert_called_once()
+    def test_optimize(self) -> None:
+        """Optimize command must execute without error (Tantivy handles optimization automatically)."""
+        call_command("document_index", "optimize", skip_checks=True)
+
+    def test_reindex_recreate_wipes_index(self, mocker: MockerFixture) -> None:
+        """Reindex with --recreate must wipe the index before rebuilding."""
+        mock_wipe = mocker.patch(
+            "documents.management.commands.document_index.wipe_index",
+        )
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command("document_index", "reindex", recreate=True, skip_checks=True)
+        mock_wipe.assert_called_once()
+        mock_get_backend.return_value.rebuild.assert_called_once()
+
+    def test_reindex_without_recreate_does_not_wipe_index(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """Reindex without --recreate must not wipe the index."""
+        mock_wipe = mocker.patch(
+            "documents.management.commands.document_index.wipe_index",
+        )
+        mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command("document_index", "reindex", skip_checks=True)
+        mock_wipe.assert_not_called()
+
+    def test_reindex_if_needed_skips_when_up_to_date(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """Conditional reindex must skip rebuild when schema version and language match."""
+        mocker.patch(
+            "documents.management.commands.document_index.needs_rebuild",
+            return_value=False,
+        )
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command("document_index", "reindex", if_needed=True, skip_checks=True)
+        mock_get_backend.return_value.rebuild.assert_not_called()
+
+    def test_reindex_if_needed_runs_when_rebuild_needed(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """Conditional reindex must proceed with rebuild when schema version or language changed."""
+        mocker.patch(
+            "documents.management.commands.document_index.needs_rebuild",
+            return_value=True,
+        )
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command("document_index", "reindex", if_needed=True, skip_checks=True)
+        mock_get_backend.return_value.rebuild.assert_called_once()
+
+    def test_reindex_default_heap_size_not_overridden(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """Without --heap-size-mb, rebuild must use its own default heap size."""
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command("document_index", "reindex", skip_checks=True)
+        _, kwargs = mock_get_backend.return_value.rebuild.call_args
+        assert "writer_heap_bytes" not in kwargs
+
+    def test_reindex_heap_size_mb_passed_to_rebuild(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """--heap-size-mb must convert to bytes and pass through to rebuild."""
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command(
+            "document_index",
+            "reindex",
+            heap_size_mb=128,
+            skip_checks=True,
+        )
+        _, kwargs = mock_get_backend.return_value.rebuild.call_args
+        assert kwargs["writer_heap_bytes"] == 128_000_000
 
 
+@pytest.mark.management
 class TestRenamer(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
     @override_settings(FILENAME_FORMAT="")
     def test_rename(self) -> None:
@@ -118,7 +219,7 @@ class TestRenamer(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
         Path(doc.archive_path).touch()
 
         with override_settings(FILENAME_FORMAT="{correspondent}/{title}"):
-            call_command("document_renamer")
+            call_command("document_renamer", skip_checks=True)
 
         doc2 = Document.objects.get(id=doc.id)
 
@@ -130,54 +231,50 @@ class TestRenamer(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
         self.assertIsFile(doc2.archive_path)
 
 
-class TestCreateClassifier(TestCase):
-    @mock.patch(
-        "documents.management.commands.document_create_classifier.train_classifier",
-    )
-    def test_create_classifier(self, m) -> None:
-        call_command("document_create_classifier")
-
-        m.assert_called_once()
-
-
-class TestSanityChecker(DirectoriesMixin, TestCase):
-    def test_no_issues(self) -> None:
-        with self.assertLogs() as capture:
-            call_command("document_sanity_checker")
-
-        self.assertEqual(len(capture.output), 1)
-        self.assertIn("Sanity checker detected no issues.", capture.output[0])
-
-    def test_errors(self) -> None:
-        doc = Document.objects.create(
-            title="test",
-            content="test",
-            filename="test.pdf",
-            checksum="abc",
+@pytest.mark.management
+class TestCreateClassifier:
+    def test_create_classifier(self, mocker: MockerFixture) -> None:
+        m = mocker.patch(
+            "documents.management.commands.document_create_classifier.train_classifier",
         )
-        Path(doc.source_path).touch()
-        Path(doc.thumbnail_path).touch()
 
-        with self.assertLogs() as capture:
-            call_command("document_sanity_checker")
+        call_command("document_create_classifier", skip_checks=True)
 
-        self.assertEqual(len(capture.output), 2)
-        self.assertIn("Checksum mismatch. Stored: abc, actual:", capture.output[1])
+        m.assert_called_once_with(status_callback=mocker.ANY)
+        assert callable(m.call_args.kwargs["status_callback"])
+
+    def test_create_classifier_callback_output(self, mocker: MockerFixture) -> None:
+        """Callback passed to train_classifier writes each phase message to the console."""
+        m = mocker.patch(
+            "documents.management.commands.document_create_classifier.train_classifier",
+        )
+
+        def invoke_callback(**kwargs):
+            kwargs["status_callback"]("Vectorizing document content...")
+
+        m.side_effect = invoke_callback
+
+        stdout = StringIO()
+        call_command("document_create_classifier", skip_checks=True, stdout=stdout)
+
+        assert "Vectorizing document content..." in stdout.getvalue()
 
 
+@pytest.mark.management
 class TestConvertMariaDBUUID(TestCase):
     @mock.patch("django.db.connection.schema_editor")
     def test_convert(self, m) -> None:
         m.alter_field.return_value = None
 
         stdout = StringIO()
-        call_command("convert_mariadb_uuid", stdout=stdout)
+        call_command("convert_mariadb_uuid", stdout=stdout, skip_checks=True)
 
         m.assert_called_once()
 
         self.assertIn("Successfully converted", stdout.getvalue())
 
 
+@pytest.mark.management
 class TestPruneAuditLogs(TestCase):
     def test_prune_audit_logs(self) -> None:
         LogEntry.objects.create(
@@ -185,6 +282,6 @@ class TestPruneAuditLogs(TestCase):
             object_id=1,
             action=LogEntry.Action.CREATE,
         )
-        call_command("prune_audit_logs")
+        call_command("prune_audit_logs", skip_checks=True)
 
         self.assertEqual(LogEntry.objects.count(), 0)

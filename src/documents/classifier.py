@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import pickle
 import re
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
     from datetime import datetime
 
@@ -26,8 +28,32 @@ from documents.caching import CLASSIFIER_VERSION_KEY
 from documents.caching import StoredLRUCache
 from documents.models import Document
 from documents.models import MatchingModel
+from paperless.signed_pickle import SignedPickleError
+from paperless.signed_pickle import signed_pickle_dumps
+from paperless.signed_pickle import signed_pickle_loads
 
 logger = logging.getLogger("paperless.classifier")
+
+
+def _predict_with_threshold(classifier, X, threshold: float) -> int | None:
+    """
+    Return the predicted class id, or None if:
+    - the prediction is -1 (no match), or
+    - the winning class probability is below the configured threshold.
+
+    Using predict_proba() instead of predict() lets us apply a minimum-confidence
+    cutoff so that uncertain predictions are discarded rather than assigned.
+    """
+    probas = classifier.predict_proba(X)[0]
+    best_idx = int(probas.argmax())
+    best_class = int(classifier.classes_[best_idx])
+
+    if best_class == -1:
+        return None
+    if threshold > 0.0 and probas[best_idx] < threshold:
+        return None
+    return best_class
+
 
 ADVANCED_TEXT_PROCESSING_ENABLED = (
     settings.NLTK_LANGUAGE is not None and settings.NLTK_ENABLED
@@ -74,7 +100,7 @@ def load_classifier(*, raise_exception: bool = False) -> DocumentClassifier | No
             "Unrecoverable error while loading document "
             "classification model, deleting model file.",
         )
-        Path(settings.MODEL_FILE).unlink
+        Path(settings.MODEL_FILE).unlink()
         classifier = None
         if raise_exception:
             raise e
@@ -96,7 +122,11 @@ class DocumentClassifier:
     # v7 - Updated scikit-learn package version
     # v8 - Added storage path classifier
     # v9 - Changed from hashing to time/ids for re-train check
-    FORMAT_VERSION = 9
+    # v10 - HMAC-signed model file
+    # v11 - Use sample_weight for balanced training; predict_proba with threshold
+    FORMAT_VERSION = 11
+
+    HMAC_SIZE = 32  # SHA-256 digest length
 
     def __init__(self) -> None:
         # last time a document changed and therefore training might be required
@@ -127,71 +157,98 @@ class DocumentClassifier:
             pickle.dumps(self.data_vectorizer),
         ).hexdigest()
 
+    @staticmethod
+    def _compute_hmac(data: bytes) -> bytes:
+        return hmac.new(
+            settings.SECRET_KEY.encode(),
+            data,
+            sha256,
+        ).digest()
+
     def load(self) -> None:
         from sklearn.exceptions import InconsistentVersionWarning
 
+        raw = Path(settings.MODEL_FILE).read_bytes()
+
+        if len(raw) <= self.HMAC_SIZE:
+            raise ClassifierModelCorruptError
+
+        signature = raw[: self.HMAC_SIZE]
+        data = raw[self.HMAC_SIZE :]
+
+        if not hmac.compare_digest(signature, self._compute_hmac(data)):
+            raise ClassifierModelCorruptError
+
         # Catch warnings for processing
         with warnings.catch_warnings(record=True) as w:
-            with Path(settings.MODEL_FILE).open("rb") as f:
-                schema_version = pickle.load(f)
+            try:
+                (
+                    schema_version,
+                    self.last_doc_change_time,
+                    self.last_auto_type_hash,
+                    self.data_vectorizer,
+                    self.tags_binarizer,
+                    self.tags_classifier,
+                    self.correspondent_classifier,
+                    self.document_type_classifier,
+                    self.storage_path_classifier,
+                ) = pickle.loads(data)
+            except Exception as err:
+                raise ClassifierModelCorruptError from err
 
-                if schema_version != self.FORMAT_VERSION:
-                    raise IncompatibleClassifierVersionError(
-                        "Cannot load classifier, incompatible versions.",
-                    )
-                else:
-                    try:
-                        self.last_doc_change_time = pickle.load(f)
-                        self.last_auto_type_hash = pickle.load(f)
-
-                        self.data_vectorizer = pickle.load(f)
-                        self._update_data_vectorizer_hash()
-                        self.tags_binarizer = pickle.load(f)
-
-                        self.tags_classifier = pickle.load(f)
-                        self.correspondent_classifier = pickle.load(f)
-                        self.document_type_classifier = pickle.load(f)
-                        self.storage_path_classifier = pickle.load(f)
-                    except Exception as err:
-                        raise ClassifierModelCorruptError from err
-
-            # Check for the warning about unpickling from differing versions
-            # and consider it incompatible
-            sk_learn_warning_url = (
-                "https://scikit-learn.org/stable/"
-                "model_persistence.html"
-                "#security-maintainability-limitations"
+        if schema_version != self.FORMAT_VERSION:
+            raise IncompatibleClassifierVersionError(
+                "Cannot load classifier, incompatible versions.",
             )
-            for warning in w:
-                # The warning is inconsistent, the MLPClassifier is a specific warning, others have not updated yet
-                if issubclass(warning.category, InconsistentVersionWarning) or (
-                    issubclass(warning.category, UserWarning)
-                    and sk_learn_warning_url in str(warning.message)
-                ):
-                    raise IncompatibleClassifierVersionError("sklearn version update")
+
+        self._update_data_vectorizer_hash()
+
+        # Check for the warning about unpickling from differing versions
+        # and consider it incompatible
+        sk_learn_warning_url = (
+            "https://scikit-learn.org/stable/"
+            "model_persistence.html"
+            "#security-maintainability-limitations"
+        )
+        for warning in w:
+            # The warning is inconsistent, the MLPClassifier is a specific warning, others have not updated yet
+            if issubclass(warning.category, InconsistentVersionWarning) or (
+                issubclass(warning.category, UserWarning)
+                and sk_learn_warning_url in str(warning.message)
+            ):
+                raise IncompatibleClassifierVersionError("sklearn version update")
 
     def save(self) -> None:
         target_file: Path = settings.MODEL_FILE
         target_file_temp: Path = target_file.with_suffix(".pickle.part")
 
+        data = pickle.dumps(
+            (
+                self.FORMAT_VERSION,
+                self.last_doc_change_time,
+                self.last_auto_type_hash,
+                self.data_vectorizer,
+                self.tags_binarizer,
+                self.tags_classifier,
+                self.correspondent_classifier,
+                self.document_type_classifier,
+                self.storage_path_classifier,
+            ),
+        )
+
+        signature = self._compute_hmac(data)
+
         with target_file_temp.open("wb") as f:
-            pickle.dump(self.FORMAT_VERSION, f)
-
-            pickle.dump(self.last_doc_change_time, f)
-            pickle.dump(self.last_auto_type_hash, f)
-
-            pickle.dump(self.data_vectorizer, f)
-
-            pickle.dump(self.tags_binarizer, f)
-            pickle.dump(self.tags_classifier, f)
-
-            pickle.dump(self.correspondent_classifier, f)
-            pickle.dump(self.document_type_classifier, f)
-            pickle.dump(self.storage_path_classifier, f)
+            f.write(signature + data)
 
         target_file_temp.rename(target_file)
 
-    def train(self) -> bool:
+    def train(
+        self,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> bool:
+        notify = status_callback if status_callback is not None else lambda _: None
+
         # Get non-inbox documents
         docs_queryset = (
             Document.objects.exclude(
@@ -213,6 +270,7 @@ class DocumentClassifier:
 
         # Step 1: Extract and preprocess training data from the database.
         logger.debug("Gathering data from database...")
+        notify(f"Gathering data from {docs_queryset.count()} document(s)...")
         hasher = sha256()
         for doc in docs_queryset:
             y = -1
@@ -288,8 +346,16 @@ class DocumentClassifier:
         from sklearn.preprocessing import LabelBinarizer
         from sklearn.preprocessing import MultiLabelBinarizer
 
+        # MLPClassifier does not support class_weight directly
+        # (https://github.com/scikit-learn/scikit-learn/issues/9113), so we use
+        # compute_sample_weight to balance classes during training and prevent
+        # over-represented correspondents from dominating predictions.
+        # https://scikit-learn.org/stable/modules/generated/sklearn.utils.class_weight.compute_sample_weight.html
+        from sklearn.utils.class_weight import compute_sample_weight
+
         # Step 2: vectorize data
         logger.debug("Vectorizing data...")
+        notify("Vectorizing document content...")
 
         def content_generator() -> Iterator[str]:
             """
@@ -316,6 +382,7 @@ class DocumentClassifier:
         # Step 3: train the classifiers
         if num_tags > 0:
             logger.debug("Training tags classifier...")
+            notify(f"Training tags classifier ({num_tags} tag(s))...")
 
             if num_tags == 1:
                 # Special case where only one tag has auto:
@@ -331,7 +398,7 @@ class DocumentClassifier:
                 self.tags_binarizer = MultiLabelBinarizer()
                 labels_tags_vectorized = self.tags_binarizer.fit_transform(labels_tags)
 
-            self.tags_classifier = MLPClassifier(tol=0.01)
+            self.tags_classifier = MLPClassifier(tol=0.01, random_state=0)
             self.tags_classifier.fit(data_vectorized, labels_tags_vectorized)
         else:
             self.tags_classifier = None
@@ -339,8 +406,15 @@ class DocumentClassifier:
 
         if num_correspondents > 0:
             logger.debug("Training correspondent classifier...")
-            self.correspondent_classifier = MLPClassifier(tol=0.01)
-            self.correspondent_classifier.fit(data_vectorized, labels_correspondent)
+            notify(
+                f"Training correspondent classifier ({num_correspondents} correspondent(s))...",
+            )
+            self.correspondent_classifier = MLPClassifier(tol=0.01, random_state=0)
+            self.correspondent_classifier.fit(
+                data_vectorized,
+                labels_correspondent,
+                sample_weight=compute_sample_weight("balanced", labels_correspondent),
+            )
         else:
             self.correspondent_classifier = None
             logger.debug(
@@ -349,8 +423,15 @@ class DocumentClassifier:
 
         if num_document_types > 0:
             logger.debug("Training document type classifier...")
-            self.document_type_classifier = MLPClassifier(tol=0.01)
-            self.document_type_classifier.fit(data_vectorized, labels_document_type)
+            notify(
+                f"Training document type classifier ({num_document_types} type(s))...",
+            )
+            self.document_type_classifier = MLPClassifier(tol=0.01, random_state=0)
+            self.document_type_classifier.fit(
+                data_vectorized,
+                labels_document_type,
+                sample_weight=compute_sample_weight("balanced", labels_document_type),
+            )
         else:
             self.document_type_classifier = None
             logger.debug(
@@ -361,10 +442,12 @@ class DocumentClassifier:
             logger.debug(
                 "Training storage paths classifier...",
             )
-            self.storage_path_classifier = MLPClassifier(tol=0.01)
+            notify(f"Training storage path classifier ({num_storage_paths} path(s))...")
+            self.storage_path_classifier = MLPClassifier(tol=0.01, random_state=0)
             self.storage_path_classifier.fit(
                 data_vectorized,
                 labels_storage_path,
+                sample_weight=compute_sample_weight("balanced", labels_storage_path),
             )
         else:
             self.storage_path_classifier = None
@@ -485,33 +568,40 @@ class DocumentClassifier:
         serialized_result = read_cache.get(key)
         if serialized_result is None:
             result = self.data_vectorizer.transform([self.preprocess_content(content)])
-            read_cache.set(key, pickle.dumps(result), CACHE_5_MINUTES)
+            read_cache.set(key, signed_pickle_dumps(result), CACHE_5_MINUTES)
         else:
-            read_cache.touch(key, CACHE_5_MINUTES)
-            result = pickle.loads(serialized_result)
+            try:
+                result = signed_pickle_loads(serialized_result)
+            except SignedPickleError:
+                result = self.data_vectorizer.transform(
+                    [self.preprocess_content(content)],
+                )
+                read_cache.set(key, signed_pickle_dumps(result), CACHE_5_MINUTES)
+            else:
+                read_cache.touch(key, CACHE_5_MINUTES)
         return result
 
     def predict_correspondent(self, content: str) -> int | None:
         if self.correspondent_classifier:
             X = self._vectorize(content)
-            correspondent_id = self.correspondent_classifier.predict(X)
-            if correspondent_id != -1:
-                return correspondent_id
-            else:
-                return None
-        else:
-            return None
+            predicted_id = _predict_with_threshold(
+                self.correspondent_classifier,
+                X,
+                settings.CLASSIFIER_MATCH_THRESHOLD,
+            )
+            return predicted_id
+        return None
 
     def predict_document_type(self, content: str) -> int | None:
         if self.document_type_classifier:
             X = self._vectorize(content)
-            document_type_id = self.document_type_classifier.predict(X)
-            if document_type_id != -1:
-                return document_type_id
-            else:
-                return None
-        else:
-            return None
+            predicted_id = _predict_with_threshold(
+                self.document_type_classifier,
+                X,
+                settings.CLASSIFIER_MATCH_THRESHOLD,
+            )
+            return predicted_id
+        return None
 
     def predict_tags(self, content: str) -> list[int]:
         from sklearn.utils.multiclass import type_of_target
@@ -537,10 +627,10 @@ class DocumentClassifier:
     def predict_storage_path(self, content: str) -> int | None:
         if self.storage_path_classifier:
             X = self._vectorize(content)
-            storage_path_id = self.storage_path_classifier.predict(X)
-            if storage_path_id != -1:
-                return storage_path_id
-            else:
-                return None
-        else:
-            return None
+            predicted_id = _predict_with_threshold(
+                self.storage_path_classifier,
+                X,
+                settings.CLASSIFIER_MATCH_THRESHOLD,
+            )
+            return predicted_id
+        return None

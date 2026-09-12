@@ -9,6 +9,15 @@ describe('PngxPdfViewerComponent', () => {
   let fixture: ComponentFixture<PngxPdfViewerComponent>
   let component: PngxPdfViewerComponent
 
+  const setBaseHref = (href: string) => {
+    let base = document.querySelector('base')
+    if (!base) {
+      base = document.createElement('base')
+      document.head.appendChild(base)
+    }
+    base.setAttribute('href', href)
+  }
+
   const initComponent = async (src = 'test.pdf') => {
     component.src = src
     fixture.detectChanges()
@@ -24,6 +33,10 @@ describe('PngxPdfViewerComponent', () => {
     component = fixture.componentInstance
   })
 
+  afterEach(() => {
+    setBaseHref('/')
+  })
+
   it('loads a document and emits events', async () => {
     const loadSpy = jest.fn()
     const renderedSpy = jest.fn()
@@ -33,17 +46,37 @@ describe('PngxPdfViewerComponent', () => {
     await initComponent()
 
     expect(pdfjs.GlobalWorkerOptions.workerSrc).toBe(
-      '/assets/js/pdf.worker.min.mjs'
+      new URL('assets/js/pdf.worker.min.mjs', document.baseURI).toString()
     )
     const isVisible = (component as any).findController.onIsPageVisible as
-      | (() => boolean)
-      | undefined
+      (() => boolean) | undefined
     expect(isVisible?.()).toBe(true)
     expect(loadSpy).toHaveBeenCalledWith(
       expect.objectContaining({ numPages: 1 })
     )
     expect(renderedSpy).toHaveBeenCalled()
     expect((component as any).pdfViewer).toBeInstanceOf(PDFViewer)
+  })
+
+  it('resolves the worker source relative to the document base URI', async () => {
+    setBaseHref('/paperless/')
+    const getDocumentSpy = jest.spyOn(pdfjs, 'getDocument')
+
+    await initComponent()
+
+    expect(pdfjs.GlobalWorkerOptions.workerSrc).toBe(
+      new URL('assets/js/pdf.worker.min.mjs', document.baseURI).toString()
+    )
+    expect(pdfjs.GlobalWorkerOptions.workerSrc).toContain(
+      '/paperless/assets/js/pdf.worker.min.mjs'
+    )
+    expect(getDocumentSpy).toHaveBeenCalledWith({
+      url: 'test.pdf',
+      password: undefined,
+      withCredentials: true,
+      wasmUrl: expect.stringContaining('/paperless/assets/wasm/'),
+      iccUrl: expect.stringContaining('/paperless/assets/iccs/'),
+    })
   })
 
   it('initializes single-page viewer and disables text layer', async () => {
@@ -57,6 +90,7 @@ describe('PngxPdfViewerComponent', () => {
     }
     expect(viewer).toBeInstanceOf(PDFSinglePageViewer)
     expect(viewer.options.textLayerMode).toBe(0)
+    expect(viewer.options.enableSelectionRendering).toBe(false)
   })
 
   it('applies zoom, rotation, and page changes', async () => {
@@ -64,6 +98,13 @@ describe('PngxPdfViewerComponent', () => {
 
     const pageSpy = jest.fn()
     component.pageChange.subscribe(pageSpy)
+
+    // In real usage the viewer may have multiple pages; our pdfjs mock defaults
+    // to a single page, so explicitly simulate a multi-page document here.
+    const pdf = (component as any).pdf as { numPages: number }
+    pdf.numPages = 3
+    const viewer = (component as any).pdfViewer as PDFViewer
+    viewer.setDocument(pdf)
 
     component.zoomScale = PdfZoomScale.PageFit
     component.zoom = PdfZoomLevel.Two
@@ -81,7 +122,6 @@ describe('PngxPdfViewerComponent', () => {
       page: new SimpleChange(undefined, 2, false),
     })
 
-    const viewer = (component as any).pdfViewer as PDFViewer
     expect(viewer.pagesRotation).toBe(90)
     expect(viewer.currentPageNumber).toBe(2)
     expect(pageSpy).toHaveBeenCalledWith(2)
@@ -90,13 +130,37 @@ describe('PngxPdfViewerComponent', () => {
     ;(component as any).applyScale()
     expect(viewer.currentScaleValue).toBe(PdfZoomScale.PageFit)
     expect(viewer.currentScale).toBe(2)
+  })
 
+  it('does not reapply scale for page-only changes', async () => {
+    await initComponent()
+
+    const pdf = (component as any).pdf as { numPages: number }
+    pdf.numPages = 3
+    const viewer = (component as any).pdfViewer as PDFViewer
+    viewer.setDocument(pdf)
     const applyScaleSpy = jest.spyOn(component as any, 'applyScale')
     component.page = 2
-    ;(component as any).lastViewerPage = 2
-    ;(component as any).applyViewerState()
+
+    component.ngOnChanges({
+      page: new SimpleChange(1, 2, false),
+    })
+
+    expect(viewer.currentPageNumber).toBe(2)
     expect((component as any).lastViewerPage).toBeUndefined()
-    expect(applyScaleSpy).toHaveBeenCalled()
+    expect(applyScaleSpy).not.toHaveBeenCalled()
+  })
+
+  it('does not reset the viewer when it is already on the requested page', async () => {
+    await initComponent()
+
+    const viewer = (component as any).pdfViewer as PDFViewer
+    const currentPageSpy = jest.spyOn(viewer, 'currentPageNumber', 'set')
+    component.page = viewer.currentPageNumber
+
+    ;(component as any).applyViewerState()
+
+    expect(currentPageSpy).not.toHaveBeenCalled()
   })
 
   it('dispatches find when search query changes after render', async () => {
@@ -196,6 +260,8 @@ describe('PngxPdfViewerComponent', () => {
     const scaleSpy = jest.spyOn(component as any, 'applyViewerState')
     const resizeSpy = jest.spyOn(component as any, 'setupResizeObserver')
 
+    // Angular sets the input value before calling ngOnChanges; mirror that here.
+    component.src = 'test.pdf'
     component.ngOnChanges({
       src: new SimpleChange(undefined, 'test.pdf', true),
       zoomScale: new SimpleChange(
@@ -209,6 +275,41 @@ describe('PngxPdfViewerComponent', () => {
     expect(resizeSpy).not.toHaveBeenCalled()
     expect(initSpy).not.toHaveBeenCalled()
     expect(scaleSpy).not.toHaveBeenCalled()
+  })
+
+  it('resets viewer state on src change', () => {
+    const mockViewer = {
+      setDocument: jest.fn(),
+      currentPageNumber: 7,
+      cleanup: jest.fn(),
+    }
+    ;(component as any).pdfViewer = mockViewer
+    ;(component as any).loadingTask = { destroy: jest.fn() }
+    jest.spyOn(component as any, 'loadDocument').mockImplementation(() => {})
+
+    component.src = 'test.pdf'
+    component.ngOnChanges({
+      src: new SimpleChange(undefined, 'test.pdf', true),
+    })
+
+    expect(mockViewer.setDocument).toHaveBeenCalledWith(null)
+    expect(mockViewer.currentPageNumber).toBe(1)
+  })
+
+  it('reloads when the source revision changes', () => {
+    const resetSpy = jest.spyOn(component as any, 'resetViewerState')
+    const loadSpy = jest
+      .spyOn(component as any, 'loadDocument')
+      .mockImplementation(() => {})
+    component.src = 'test.pdf'
+    component.sourceRevision = 1
+
+    component.ngOnChanges({
+      sourceRevision: new SimpleChange(0, 1, false),
+    })
+
+    expect(resetSpy).toHaveBeenCalled()
+    expect(loadSpy).toHaveBeenCalled()
   })
 
   it('applies viewer state after view init when already loaded', () => {

@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import unicodedata
 from collections.abc import Iterable
 from pathlib import PurePath
 
@@ -36,10 +37,12 @@ class FilePathTemplate(Template):
         def clean_filepath(value: str) -> str:
             """
             Clean up a filepath by:
-            1. Removing newlines and carriage returns
-            2. Removing extra spaces before and after forward slashes
-            3. Preserving spaces in other parts of the path
+            1. Normalizing Unicode to NFC form to prevent byte-level mismatches
+            2. Removing newlines and carriage returns
+            3. Removing extra spaces before and after forward slashes
+            4. Preserving spaces in other parts of the path
             """
+            value = unicodedata.normalize("NFC", value)
             value = value.replace("\n", "").replace("\r", "")
             value = re.sub(r"\s*/\s*", "/", value)
 
@@ -77,6 +80,23 @@ class PlaceholderString(str):
 
 
 NO_VALUE_PLACEHOLDER = PlaceholderString("-none-")
+
+
+class MatchingModelContext:
+    """
+    Safe template context for related objects.
+
+    Keeps legacy behavior where including the object ina template yields the related object's
+    name as a string, while still exposing limited attributes.
+    """
+
+    def __init__(self, *, id: int, name: str, path: str | None = None):
+        self.id = id
+        self.name = name
+        self.path = path
+
+    def __str__(self) -> str:
+        return self.name
 
 
 _template_environment.undefined = _LogStrictUndefined
@@ -164,17 +184,17 @@ def get_basic_metadata_context(
     """
     return {
         "title": pathvalidate.sanitize_filename(
-            document.title,
+            unicodedata.normalize("NFC", document.title),
             replacement_text="-",
         ),
         "correspondent": pathvalidate.sanitize_filename(
-            document.correspondent.name,
+            unicodedata.normalize("NFC", document.correspondent.name),
             replacement_text="-",
         )
         if document.correspondent
         else no_value_default,
         "document_type": pathvalidate.sanitize_filename(
-            document.document_type.name,
+            unicodedata.normalize("NFC", document.document_type.name),
             replacement_text="-",
         )
         if document.document_type
@@ -185,10 +205,66 @@ def get_basic_metadata_context(
         "owner_username": document.owner.username
         if document.owner
         else no_value_default,
-        "original_name": PurePath(document.original_filename).with_suffix("").name
+        "original_name": unicodedata.normalize(
+            "NFC",
+            PurePath(document.original_filename).with_suffix("").name,
+        )
         if document.original_filename
         else no_value_default,
         "doc_pk": f"{document.pk:07}",
+    }
+
+
+def get_safe_document_context(
+    document: Document,
+    tags: Iterable[Tag],
+) -> dict[str, object]:
+    """
+    Build a document context object to avoid supplying entire model instance.
+    """
+    return {
+        "id": document.pk,
+        "pk": document.pk,
+        "title": document.title,
+        "content": document.content,
+        "page_count": document.page_count,
+        "created": document.created,
+        "added": document.added,
+        "modified": document.modified,
+        "archive_serial_number": document.archive_serial_number,
+        "mime_type": document.mime_type,
+        "checksum": document.checksum,
+        "archive_checksum": document.archive_checksum,
+        "filename": document.filename,
+        "archive_filename": document.archive_filename,
+        "original_filename": document.original_filename,
+        "owner": {"username": document.owner.username, "id": document.owner.id}
+        if document.owner
+        else None,
+        "tags": [{"name": tag.name, "id": tag.id} for tag in tags],
+        "correspondent": (
+            MatchingModelContext(
+                name=document.correspondent.name,
+                id=document.correspondent.id,
+            )
+            if document.correspondent
+            else None
+        ),
+        "document_type": (
+            MatchingModelContext(
+                name=document.document_type.name,
+                id=document.document_type.id,
+            )
+            if document.document_type
+            else None
+        ),
+        "storage_path": MatchingModelContext(
+            name=document.storage_path.name,
+            path=document.storage_path.path,
+            id=document.storage_path.id,
+        )
+        if document.storage_path
+        else None,
     }
 
 
@@ -199,12 +275,12 @@ def get_tags_context(tags: Iterable[Tag]) -> dict[str, str | list[str]]:
     return {
         "tag_list": pathvalidate.sanitize_filename(
             ",".join(
-                sorted(tag.name for tag in tags),
+                sorted(unicodedata.normalize("NFC", tag.name) for tag in tags),
             ),
             replacement_text="-",
         ),
         # Assumed to be ordered, but a template could loop through to find what they want
-        "tag_name_list": [x.name for x in tags],
+        "tag_name_list": [unicodedata.normalize("NFC", x.name) for x in tags],
     }
 
 
@@ -231,7 +307,7 @@ def get_custom_fields_context(
             CustomField.FieldDataType.LONG_TEXT,
         }:
             value = pathvalidate.sanitize_filename(
-                field_instance.value,
+                unicodedata.normalize("NFC", field_instance.value),
                 replacement_text="-",
             )
         elif (
@@ -240,10 +316,13 @@ def get_custom_fields_context(
         ):
             options = field_instance.field.extra_data["select_options"]
             value = pathvalidate.sanitize_filename(
-                next(
-                    option["label"]
-                    for option in options
-                    if option["id"] == field_instance.value
+                unicodedata.normalize(
+                    "NFC",
+                    next(
+                        option["label"]
+                        for option in options
+                        if option["id"] == field_instance.value
+                    ),
                 ),
                 replacement_text="-",
             )
@@ -251,7 +330,7 @@ def get_custom_fields_context(
             value = field_instance.value
         field_data["custom_fields"][
             pathvalidate.sanitize_filename(
-                field_instance.field.name,
+                unicodedata.normalize("NFC", field_instance.field.name),
                 replacement_text="-",
             )
         ] = {
@@ -261,7 +340,7 @@ def get_custom_fields_context(
     return field_data
 
 
-def _is_safe_relative_path(value: str) -> bool:
+def is_safe_relative_path(value: str) -> bool:
     if value == "":
         return True
 
@@ -302,7 +381,7 @@ def validate_filepath_template_and_render(
 
     # Build the context dictionary
     context = (
-        {"document": document}
+        {"document": get_safe_document_context(document, tags=tags_list)}
         | get_basic_metadata_context(document, no_value_default=NO_VALUE_PLACEHOLDER)
         | get_creation_date_context(document)
         | get_added_date_context(document)
@@ -319,7 +398,7 @@ def validate_filepath_template_and_render(
         )
         rendered_template = template.render(context)
 
-        if not _is_safe_relative_path(rendered_template):
+        if not is_safe_relative_path(rendered_template):
             logger.warning(
                 "Template rendered an unsafe path (absolute or containing traversal).",
             )

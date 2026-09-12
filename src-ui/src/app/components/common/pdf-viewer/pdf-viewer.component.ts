@@ -1,8 +1,10 @@
 import {
   AfterViewInit,
   Component,
+  DOCUMENT,
   ElementRef,
   EventEmitter,
+  inject,
   Input,
   OnChanges,
   OnDestroy,
@@ -11,6 +13,7 @@ import {
   ViewChild,
 } from '@angular/core'
 import {
+  AnnotationMode,
   getDocument,
   GlobalWorkerOptions,
   PDFDocumentLoadingTask,
@@ -25,7 +28,6 @@ import {
 } from 'pdfjs-dist/web/pdf_viewer.mjs'
 import {
   PdfRenderMode,
-  PdfSource,
   PdfZoomLevel,
   PdfZoomScale,
   PngxPdfDocumentProxy,
@@ -39,7 +41,11 @@ import {
 export class PngxPdfViewerComponent
   implements AfterViewInit, OnChanges, OnDestroy
 {
-  @Input() src!: PdfSource
+  private readonly document = inject<Document>(DOCUMENT)
+
+  @Input() src!: string
+  @Input() sourceRevision = 0
+  @Input() password?: string
   @Input() page?: number
   @Output() pageChange = new EventEmitter<number>()
   @Input() rotation?: number
@@ -81,7 +87,7 @@ export class PngxPdfViewerComponent
     this.dispatchFindIfReady()
     this.rendered.emit()
   }
-  private readonly onPagesInit = () => this.applyScale()
+  private readonly onPagesInit = () => this.applyViewerState()
   private readonly onPageChanging = (evt: { pageNumber: number }) => {
     // Avoid [(page)] two-way binding re-triggers navigation
     this.lastViewerPage = evt.pageNumber
@@ -89,9 +95,11 @@ export class PngxPdfViewerComponent
   }
 
   ngOnChanges(changes: SimpleChanges): void {
-    if (changes['src']) {
-      this.hasLoaded = false
-      this.loadDocument()
+    if (changes['src'] || changes['sourceRevision'] || changes['password']) {
+      this.resetViewerState()
+      if (this.src) {
+        this.loadDocument()
+      }
       return
     }
 
@@ -109,7 +117,10 @@ export class PngxPdfViewerComponent
       changes['zoomScale'] ||
       changes['rotation']
     ) {
-      this.applyViewerState()
+      // Prevent loop with page / scale application see https://github.com/paperless-ngx/paperless-ngx/issues/13404
+      this.applyViewerState(
+        !!(changes['zoom'] || changes['zoomScale'] || changes['rotation'])
+      )
     }
 
     if (changes['searchQuery']) {
@@ -139,6 +150,21 @@ export class PngxPdfViewerComponent
     this.pdfViewer = undefined
   }
 
+  private resetViewerState(): void {
+    this.hasLoaded = false
+    this.hasRenderedPage = false
+    this.lastFindQuery = ''
+    this.lastViewerPage = undefined
+    this.loadingTask?.destroy()
+    this.loadingTask = undefined
+    this.pdf = undefined
+    this.linkService.setDocument(null)
+    if (this.pdfViewer) {
+      this.pdfViewer.setDocument(null)
+      this.pdfViewer.currentPageNumber = 1
+    }
+  }
+
   private async loadDocument(): Promise<void> {
     if (this.hasLoaded) {
       return
@@ -149,9 +175,18 @@ export class PngxPdfViewerComponent
     this.lastFindQuery = ''
     this.loadingTask?.destroy()
 
-    GlobalWorkerOptions.workerSrc = '/assets/js/pdf.worker.min.mjs'
-    this.loadingTask = getDocument(this.src)
-
+    GlobalWorkerOptions.workerSrc = new URL(
+      'assets/js/pdf.worker.min.mjs',
+      this.document.baseURI
+    ).toString()
+    const initOptions = {
+      url: this.src,
+      password: this.password,
+      withCredentials: true,
+      wasmUrl: new URL('assets/wasm/', this.document.baseURI).toString(),
+      iccUrl: new URL('assets/iccs/', this.document.baseURI).toString(),
+    }
+    this.loadingTask = getDocument(initOptions)
     try {
       const pdf = await this.loadingTask.promise
       this.pdf = pdf
@@ -187,6 +222,8 @@ export class PngxPdfViewerComponent
       linkService: this.linkService,
       findController: this.findController,
       textLayerMode,
+      annotationMode: AnnotationMode.ENABLE,
+      enableSelectionRendering: false,
       removePageBorders: true,
     }
 
@@ -209,7 +246,7 @@ export class PngxPdfViewerComponent
     }
   }
 
-  private applyViewerState(): void {
+  private applyViewerState(applyScale = true): void {
     if (!this.pdfViewer) {
       return
     }
@@ -222,12 +259,18 @@ export class PngxPdfViewerComponent
       hasPages &&
       this.page !== this.lastViewerPage
     ) {
-      this.pdfViewer.currentPageNumber = this.page
+      const nextPage = Math.min(
+        Math.max(Math.trunc(this.page), 1),
+        this.pdfViewer.pagesCount
+      )
+      if (nextPage !== this.pdfViewer.currentPageNumber) {
+        this.pdfViewer.currentPageNumber = nextPage
+      }
     }
     if (this.page === this.lastViewerPage) {
       this.lastViewerPage = undefined
     }
-    if (hasPages) {
+    if (hasPages && applyScale) {
       this.applyScale()
     }
     this.dispatchFindIfReady()
@@ -251,7 +294,7 @@ export class PngxPdfViewerComponent
     if (!this.hasRenderedPage) {
       return
     }
-    const query = this.searchQuery.trim()
+    const query = this.searchQuery?.trim()
     if (query === this.lastFindQuery) {
       return
     }
@@ -259,7 +302,7 @@ export class PngxPdfViewerComponent
     this.eventBus.dispatch('find', {
       query,
       caseSensitive: false,
-      highlightAll: query.length > 0,
+      highlightAll: query?.length > 0,
       phraseSearch: true,
     })
   }

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import regex as regex_mod
 from django.conf import settings
 from pdf2image import convert_from_path
 from pikepdf import Page
@@ -16,20 +17,22 @@ from pikepdf import Pdf
 from documents.converters import convert_from_tiff_to_pdf
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
+from documents.data_models import DocumentSource
 from documents.models import Document
+from documents.models import PaperlessTask
 from documents.models import Tag
 from documents.plugins.base import ConsumeTaskPlugin
 from documents.plugins.base import StopConsumeTaskError
 from documents.plugins.helpers import ProgressManager
 from documents.plugins.helpers import ProgressStatusOptions
+from documents.regex import safe_regex_match
+from documents.regex import safe_regex_sub
 from documents.utils import copy_basic_file_stats
 from documents.utils import copy_file_with_basic_stats
 from documents.utils import maybe_override_pixel_limit
 from paperless.config import BarcodeConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from PIL import Image
 
 logger = logging.getLogger("paperless.barcodes")
@@ -70,8 +73,8 @@ class Barcode:
         Note: This does NOT exclude ASN or separator barcodes - they can also be used
         as tags if they match a tag mapping pattern (e.g., {"ASN12.*": "JOHN"}).
         """
-        for regex in self.settings.barcode_tag_mapping:
-            if re.match(regex, self.value, flags=re.IGNORECASE):
+        for pattern in self.settings.barcode_tag_mapping:
+            if safe_regex_match(pattern, self.value, flags=regex_mod.IGNORECASE):
                 return True
         return False
 
@@ -192,23 +195,36 @@ class BarcodePlugin(ConsumeTaskPlugin):
 
             from documents import tasks
 
+            _SOURCE_TO_TRIGGER: dict[DocumentSource, PaperlessTask.TriggerSource] = {
+                DocumentSource.ConsumeFolder: PaperlessTask.TriggerSource.FOLDER_CONSUME,
+                DocumentSource.ApiUpload: PaperlessTask.TriggerSource.API_UPLOAD,
+                DocumentSource.MailFetch: PaperlessTask.TriggerSource.EMAIL_CONSUME,
+                DocumentSource.WebUI: PaperlessTask.TriggerSource.WEB_UI,
+            }
+            trigger_source = _SOURCE_TO_TRIGGER.get(
+                self.input_doc.source,
+                PaperlessTask.TriggerSource.MANUAL,
+            )
+
             # Create the split document tasks
             for new_document in self.separate_pages(separator_pages):
                 copy_file_with_basic_stats(new_document, tmp_dir / new_document.name)
 
-                task = tasks.consume_file.delay(
-                    ConsumableDocument(
-                        # Same source, for templates
-                        source=self.input_doc.source,
-                        mailrule_id=self.input_doc.mailrule_id,
-                        # Can't use same folder or the consume might grab it again
-                        original_file=(tmp_dir / new_document.name).resolve(),
-                        # Adding optional original_path for later uses in
-                        # workflow matching
-                        original_path=self.input_doc.original_file,
-                    ),
-                    # All the same metadata
-                    self.metadata,
+                task = tasks.consume_file.apply_async(
+                    kwargs={
+                        "input_doc": ConsumableDocument(
+                            # Same source, for templates
+                            source=self.input_doc.source,
+                            mailrule_id=self.input_doc.mailrule_id,
+                            # Can't use same folder or the consume might grab it again
+                            original_file=(tmp_dir / new_document.name).resolve(),
+                            # Adding optional original_path for later uses in
+                            # workflow matching
+                            original_path=self.input_doc.original_file,
+                        ),
+                        "overrides": self.metadata,
+                    },
+                    headers={"trigger_source": trigger_source},
                 )
                 logger.info(f"Created new task {task.id} for {new_document.name}")
 
@@ -262,26 +278,6 @@ class BarcodePlugin(ConsumeTaskPlugin):
 
         return barcodes
 
-    @staticmethod
-    def read_barcodes_pyzbar(image: Image.Image) -> list[str]:
-        barcodes = []
-
-        from pyzbar import pyzbar
-
-        # Decode the barcode image
-        detected_barcodes = pyzbar.decode(image)
-
-        # Traverse through all the detected barcodes in image
-        for barcode in detected_barcodes:
-            if barcode.data:
-                decoded_barcode = barcode.data.decode("utf-8")
-                barcodes.append(decoded_barcode)
-                logger.debug(
-                    f"Barcode of type {barcode.type} found: {decoded_barcode}",
-                )
-
-        return barcodes
-
     def detect(self) -> None:
         """
         Scan all pages of the PDF as images, updating barcodes and the pages
@@ -293,14 +289,6 @@ class BarcodePlugin(ConsumeTaskPlugin):
 
         # No op if not a TIFF
         self.convert_from_tiff_to_pdf()
-
-        # Choose the library for reading
-        if settings.CONSUMER_BARCODE_SCANNER == "PYZBAR":
-            reader: Callable[[Image.Image], list[str]] = self.read_barcodes_pyzbar
-            logger.debug("Scanning for barcodes using PYZBAR")
-        else:
-            reader = self.read_barcodes_zxing
-            logger.debug("Scanning for barcodes using ZXING")
 
         try:
             # Read number of pages from pdf
@@ -349,7 +337,7 @@ class BarcodePlugin(ConsumeTaskPlugin):
                     )
 
                 # Detect barcodes
-                for barcode_value in reader(page):
+                for barcode_value in self.read_barcodes_zxing(page):
                     self.barcodes.append(
                         Barcode(current_page_number, barcode_value, self.settings),
                     )
@@ -422,11 +410,16 @@ class BarcodePlugin(ConsumeTaskPlugin):
             for raw in tag_texts.split(","):
                 try:
                     tag_str: str | None = None
-                    for regex in self.settings.barcode_tag_mapping:
-                        if re.match(regex, raw, flags=re.IGNORECASE):
-                            sub = self.settings.barcode_tag_mapping[regex]
+                    for pattern in self.settings.barcode_tag_mapping:
+                        if safe_regex_match(pattern, raw, flags=regex_mod.IGNORECASE):
+                            sub = self.settings.barcode_tag_mapping[pattern]
                             tag_str = (
-                                re.sub(regex, sub, raw, flags=re.IGNORECASE)
+                                safe_regex_sub(
+                                    pattern,
+                                    sub,
+                                    raw,
+                                    flags=regex_mod.IGNORECASE,
+                                )
                                 if sub
                                 else raw
                             )

@@ -1,9 +1,10 @@
+import { DatePipe } from '@angular/common'
 import { provideHttpClient, withInterceptorsFromDi } from '@angular/common/http'
 import {
   HttpTestingController,
   provideHttpClientTesting,
 } from '@angular/common/http/testing'
-import { EventEmitter } from '@angular/core'
+import { EventEmitter, signal } from '@angular/core'
 import { ComponentFixture, TestBed } from '@angular/core/testing'
 import { By } from '@angular/platform-browser'
 import { NgbModal, NgbModalRef } from '@ng-bootstrap/ng-bootstrap'
@@ -12,12 +13,17 @@ import { of, throwError } from 'rxjs'
 import { Correspondent } from 'src/app/data/correspondent'
 import { CustomField, CustomFieldDataType } from 'src/app/data/custom-field'
 import { DocumentType } from 'src/app/data/document-type'
+import { FILTER_TITLE } from 'src/app/data/filter-rule-type'
 import { Results } from 'src/app/data/results'
 import { StoragePath } from 'src/app/data/storage-path'
 import { Tag } from 'src/app/data/tag'
 import { FilterPipe } from 'src/app/pipes/filter.pipe'
 import { DocumentListViewService } from 'src/app/services/document-list-view.service'
-import { PermissionsService } from 'src/app/services/permissions.service'
+import {
+  PermissionAction,
+  PermissionsService,
+  PermissionType,
+} from 'src/app/services/permissions.service'
 import { CorrespondentService } from 'src/app/services/rest/correspondent.service'
 import { CustomFieldsService } from 'src/app/services/rest/custom-fields.service'
 import { DocumentTypeService } from 'src/app/services/rest/document-type.service'
@@ -36,7 +42,6 @@ import { environment } from 'src/environments/environment'
 import { CorrespondentEditDialogComponent } from '../../common/edit-dialog/correspondent-edit-dialog/correspondent-edit-dialog.component'
 import { CustomFieldEditDialogComponent } from '../../common/edit-dialog/custom-field-edit-dialog/custom-field-edit-dialog.component'
 import { DocumentTypeEditDialogComponent } from '../../common/edit-dialog/document-type-edit-dialog/document-type-edit-dialog.component'
-import { EditDialogMode } from '../../common/edit-dialog/edit-dialog.component'
 import { StoragePathEditDialogComponent } from '../../common/edit-dialog/storage-path-edit-dialog/storage-path-edit-dialog.component'
 import { TagEditDialogComponent } from '../../common/edit-dialog/tag-edit-dialog/tag-edit-dialog.component'
 import { FilterableDropdownComponent } from '../../common/filterable-dropdown/filterable-dropdown.component'
@@ -138,6 +143,7 @@ describe('BulkEditorComponent', () => {
           },
         },
         FilterPipe,
+        DatePipe,
         SettingsService,
         {
           provide: UserService,
@@ -206,6 +212,98 @@ describe('BulkEditorComponent', () => {
     expect(component.tagSelectionModel.selectionSize()).toEqual(1)
   })
 
+  it('should allow sending an all-filtered selection that fits on the current page', () => {
+    jest
+      .spyOn(documentListViewService, 'hasSelection', 'get')
+      .mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'allSelected', 'get')
+      .mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'selectedCount', 'get')
+      .mockReturnValue(5)
+    jest
+      .spyOn(documentListViewService, 'selected', 'get')
+      .mockReturnValue(new Set([1, 2, 3, 4, 5]))
+
+    fixture.detectChanges()
+
+    expect(component.canSendSelection).toBe(true)
+    expect(
+      fixture.debugElement.query(By.css('#dropdownSend')).nativeElement.disabled
+    ).toBe(false)
+  })
+
+  it('should prevent sending an all-filtered selection spanning multiple pages', () => {
+    jest
+      .spyOn(documentListViewService, 'hasSelection', 'get')
+      .mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'allSelected', 'get')
+      .mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'selectedCount', 'get')
+      .mockReturnValue(6)
+    jest
+      .spyOn(documentListViewService, 'selected', 'get')
+      .mockReturnValue(new Set([1, 2, 3, 4, 5]))
+
+    fixture.detectChanges()
+
+    expect(component.canSendSelection).toBe(false)
+    expect(
+      fixture.debugElement.query(By.css('#dropdownSend')).nativeElement.disabled
+    ).toBe(true)
+  })
+
+  it('should only show permitted share link bundle actions', () => {
+    permissionsService.initialize(
+      [
+        permissionsService.getPermissionCode(
+          PermissionAction.Add,
+          PermissionType.ShareLinkBundle
+        ),
+      ],
+      { is_superuser: false } as any
+    )
+    fixture.detectChanges()
+
+    expect(fixture.nativeElement.textContent).toContain(
+      'Create a share link bundle'
+    )
+    expect(fixture.nativeElement.textContent).not.toContain(
+      'Manage share link bundles'
+    )
+
+    permissionsService.initialize(
+      [
+        permissionsService.getPermissionCode(
+          PermissionAction.View,
+          PermissionType.ShareLinkBundle
+        ),
+      ],
+      { is_superuser: false } as any
+    )
+    fixture.detectChanges()
+
+    expect(fixture.nativeElement.textContent).not.toContain(
+      'Create a share link bundle'
+    )
+    expect(fixture.nativeElement.textContent).toContain(
+      'Manage share link bundles'
+    )
+
+    permissionsService.initialize([], { is_superuser: false } as any)
+    fixture.detectChanges()
+
+    expect(fixture.nativeElement.textContent).not.toContain(
+      'Create a share link bundle'
+    )
+    expect(fixture.nativeElement.textContent).not.toContain(
+      'Manage share link bundles'
+    )
+  })
+
   it('should apply selection data to correspondents menu', () => {
     jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
     fixture.detectChanges()
@@ -271,6 +369,92 @@ describe('BulkEditorComponent', () => {
     expect(component.customFieldsSelectionModel.selectionSize()).toEqual(1)
   })
 
+  it('should apply list selection data to tags menu when all filtered documents are selected', () => {
+    jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
+    fixture.detectChanges()
+    jest
+      .spyOn(documentListViewService, 'allSelected', 'get')
+      .mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'selectedCount', 'get')
+      .mockReturnValue(3)
+    documentListViewService.selectionData = selectionData
+    const getSelectionDataSpy = jest.spyOn(documentService, 'getSelectionData')
+
+    component.openTagsDropdown()
+
+    expect(getSelectionDataSpy).not.toHaveBeenCalled()
+    expect(component.tagSelectionModel.selectionSize()).toEqual(1)
+  })
+
+  it('should apply list selection data to document types menu when all filtered documents are selected', () => {
+    jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
+    fixture.detectChanges()
+    jest
+      .spyOn(documentListViewService, 'allSelected', 'get')
+      .mockReturnValue(true)
+    documentListViewService.selectionData = selectionData
+    const getSelectionDataSpy = jest.spyOn(documentService, 'getSelectionData')
+
+    component.openDocumentTypeDropdown()
+
+    expect(getSelectionDataSpy).not.toHaveBeenCalled()
+    expect(component.documentTypeDocumentCounts()).toEqual(
+      selectionData.selected_document_types
+    )
+  })
+
+  it('should apply list selection data to correspondents menu when all filtered documents are selected', () => {
+    jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
+    fixture.detectChanges()
+    jest
+      .spyOn(documentListViewService, 'allSelected', 'get')
+      .mockReturnValue(true)
+    documentListViewService.selectionData = selectionData
+    const getSelectionDataSpy = jest.spyOn(documentService, 'getSelectionData')
+
+    component.openCorrespondentDropdown()
+
+    expect(getSelectionDataSpy).not.toHaveBeenCalled()
+    expect(component.correspondentDocumentCounts()).toEqual(
+      selectionData.selected_correspondents
+    )
+  })
+
+  it('should apply list selection data to storage paths menu when all filtered documents are selected', () => {
+    jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
+    fixture.detectChanges()
+    jest
+      .spyOn(documentListViewService, 'allSelected', 'get')
+      .mockReturnValue(true)
+    documentListViewService.selectionData = selectionData
+    const getSelectionDataSpy = jest.spyOn(documentService, 'getSelectionData')
+
+    component.openStoragePathDropdown()
+
+    expect(getSelectionDataSpy).not.toHaveBeenCalled()
+    expect(component.storagePathDocumentCounts()).toEqual(
+      selectionData.selected_storage_paths
+    )
+  })
+
+  it('should apply list selection data to custom fields menu when all filtered documents are selected', () => {
+    jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
+    fixture.detectChanges()
+    jest
+      .spyOn(documentListViewService, 'allSelected', 'get')
+      .mockReturnValue(true)
+    documentListViewService.selectionData = selectionData
+    const getSelectionDataSpy = jest.spyOn(documentService, 'getSelectionData')
+
+    component.openCustomFieldsDropdown()
+
+    expect(getSelectionDataSpy).not.toHaveBeenCalled()
+    expect(component.customFieldDocumentCounts()).toEqual(
+      selectionData.selected_custom_fields
+    )
+  })
+
   it('should execute modify tags bulk operation', () => {
     jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
     jest
@@ -298,11 +482,54 @@ describe('BulkEditorComponent', () => {
       parameters: { add_tags: [101], remove_tags: [] },
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
     ) // listAllFilteredIds
+  })
+
+  it('should execute modify tags bulk operation for all filtered documents', () => {
+    jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'documents', 'get')
+      .mockReturnValue([{ id: 3 }, { id: 4 }])
+    jest
+      .spyOn(documentListViewService, 'selected', 'get')
+      .mockReturnValue(new Set([3, 4]))
+    jest
+      .spyOn(documentListViewService, 'allSelected', 'get')
+      .mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'filterRules', 'get')
+      .mockReturnValue([{ rule_type: FILTER_TITLE, value: 'apple' }])
+    jest
+      .spyOn(documentListViewService, 'selectedCount', 'get')
+      .mockReturnValue(25)
+    jest
+      .spyOn(permissionsService, 'currentUserHasObjectPermissions')
+      .mockReturnValue(true)
+    component.showConfirmationDialogs = false
+    fixture.detectChanges()
+
+    component.setTags({
+      itemsToAdd: [{ id: 101 }],
+      itemsToRemove: [],
+    })
+
+    const req = httpTestingController.expectOne(
+      `${environment.apiBaseUrl}documents/bulk_edit/`
+    )
+    req.flush(true)
+    expect(req.request.body).toEqual({
+      all: true,
+      filters: { title_search: 'apple' },
+      method: 'modify_tags',
+      parameters: { add_tags: [101], remove_tags: [] },
+    })
+    httpTestingController.match(
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
+    ) // list reload
   })
 
   it('should execute modify tags bulk operation with confirmation dialog if enabled', () => {
@@ -330,7 +557,7 @@ describe('BulkEditorComponent', () => {
       .expectOne(`${environment.apiBaseUrl}documents/bulk_edit/`)
       .flush(true)
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -421,7 +648,7 @@ describe('BulkEditorComponent', () => {
       parameters: { correspondent: 101 },
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -453,7 +680,7 @@ describe('BulkEditorComponent', () => {
       .expectOne(`${environment.apiBaseUrl}documents/bulk_edit/`)
       .flush(true)
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -519,7 +746,7 @@ describe('BulkEditorComponent', () => {
       parameters: { document_type: 101 },
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -551,7 +778,7 @@ describe('BulkEditorComponent', () => {
       .expectOne(`${environment.apiBaseUrl}documents/bulk_edit/`)
       .flush(true)
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -617,7 +844,7 @@ describe('BulkEditorComponent', () => {
       parameters: { storage_path: 101 },
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -649,7 +876,7 @@ describe('BulkEditorComponent', () => {
       .expectOne(`${environment.apiBaseUrl}documents/bulk_edit/`)
       .flush(true)
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -715,7 +942,7 @@ describe('BulkEditorComponent', () => {
       parameters: { add_custom_fields: [101], remove_custom_fields: [102] },
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -747,7 +974,7 @@ describe('BulkEditorComponent', () => {
       .expectOne(`${environment.apiBaseUrl}documents/bulk_edit/`)
       .flush(true)
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -849,16 +1076,14 @@ describe('BulkEditorComponent', () => {
     expect(modal).not.toBeUndefined()
     modal.componentInstance.confirm()
     let req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}documents/bulk_edit/`
+      `${environment.apiBaseUrl}documents/delete/`
     )
     req.flush(true)
     expect(req.request.body).toEqual({
       documents: [3, 4],
-      method: 'delete',
-      parameters: {},
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -868,7 +1093,7 @@ describe('BulkEditorComponent', () => {
     fixture.detectChanges()
     component.applyDelete()
     req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}documents/bulk_edit/`
+      `${environment.apiBaseUrl}documents/delete/`
     )
   })
 
@@ -944,16 +1169,15 @@ describe('BulkEditorComponent', () => {
     expect(modal).not.toBeUndefined()
     modal.componentInstance.confirm()
     let req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}documents/bulk_edit/`
+      `${environment.apiBaseUrl}documents/reprocess/`
     )
     req.flush(true)
     expect(req.request.body).toEqual({
       documents: [3, 4],
-      method: 'reprocess',
-      parameters: {},
+      remote_ocr: false,
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -979,16 +1203,16 @@ describe('BulkEditorComponent', () => {
     modal.componentInstance.rotate()
     modal.componentInstance.confirm()
     let req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}documents/bulk_edit/`
+      `${environment.apiBaseUrl}documents/rotate/`
     )
     req.flush(true)
     expect(req.request.body).toEqual({
       documents: [3, 4],
-      method: 'rotate',
-      parameters: { degrees: 90 },
+      degrees: 90,
+      source_mode: 'latest_version',
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -1018,38 +1242,37 @@ describe('BulkEditorComponent', () => {
     fixture.detectChanges()
     component.mergeSelected()
     expect(modal).not.toBeUndefined()
-    modal.componentInstance.metadataDocumentID = 3
+    modal.componentInstance.metadataDocumentID.set(3)
     modal.componentInstance.confirm()
     let req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}documents/bulk_edit/`
+      `${environment.apiBaseUrl}documents/merge/`
     )
     req.flush(true)
     expect(req.request.body).toEqual({
       documents: [3, 4],
-      method: 'merge',
-      parameters: { metadata_document_id: 3 },
+      metadata_document_id: 3,
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
     ) // listAllFilteredIds
 
     // Test with Delete Originals enabled
-    modal.componentInstance.deleteOriginals = true
+    modal.componentInstance.deleteOriginals.set(true)
     modal.componentInstance.confirm()
     req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}documents/bulk_edit/`
+      `${environment.apiBaseUrl}documents/merge/`
     )
     req.flush(true)
     expect(req.request.body).toEqual({
       documents: [3, 4],
-      method: 'merge',
-      parameters: { metadata_document_id: 3, delete_originals: true },
+      metadata_document_id: 3,
+      delete_originals: true,
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -1057,25 +1280,108 @@ describe('BulkEditorComponent', () => {
     expect(documentListViewService.selected.size).toEqual(0)
 
     // Test with archiveFallback enabled
-    modal.componentInstance.deleteOriginals = false
-    modal.componentInstance.archiveFallback = true
+    modal.componentInstance.deleteOriginals.set(false)
+    modal.componentInstance.archiveFallback.set(true)
     modal.componentInstance.confirm()
     req = httpTestingController.expectOne(
-      `${environment.apiBaseUrl}documents/bulk_edit/`
+      `${environment.apiBaseUrl}documents/merge/`
     )
     req.flush(true)
     expect(req.request.body).toEqual({
       documents: [3, 4],
-      method: 'merge',
-      parameters: { metadata_document_id: 3, archive_fallback: true },
+      metadata_document_id: 3,
+      archive_fallback: true,
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
     ) // listAllFilteredIds
     expect(documentListViewService.selected.size).toEqual(0)
+  })
+
+  it('should support merging documents as versions', () => {
+    let modal: NgbModalRef
+    modalService.activeInstances.subscribe((m) => (modal = m[0]))
+    jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'documents', 'get')
+      .mockReturnValue([{ id: 3 }, { id: 4 }])
+    jest.spyOn(documentService, 'getFew').mockReturnValue(
+      of({
+        all: [3, 4],
+        count: 2,
+        results: [
+          { id: 3, title: 'Document 3' },
+          { id: 4, title: 'Document 4' },
+        ],
+      })
+    )
+    jest
+      .spyOn(documentListViewService, 'selected', 'get')
+      .mockReturnValue(new Set([3, 4]))
+    jest
+      .spyOn(permissionsService, 'currentUserHasObjectPermissions')
+      .mockReturnValue(true)
+    jest
+      .spyOn(permissionsService, 'currentUserOwnsObject')
+      .mockReturnValue(true)
+    const mergeAsVersionsSpy = jest
+      .spyOn(documentService, 'mergeDocumentsAsVersions')
+      .mockReturnValue(of(true))
+    const toastInfoSpy = jest.spyOn(toastService, 'showInfo')
+    fixture.detectChanges()
+
+    component.mergeSelectedAsVersions()
+    expect(modal).not.toBeUndefined()
+    modal.componentInstance.rootDocumentID.set(4)
+    modal.componentInstance.confirm()
+
+    expect(mergeAsVersionsSpy).toHaveBeenCalledWith([3, 4], 4)
+    httpTestingController.match(
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
+    )
+    httpTestingController.match(
+      `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
+    )
+    expect(documentListViewService.selected.size).toEqual(0)
+    expect(toastInfoSpy).toHaveBeenCalledWith('Documents merged as versions.')
+  })
+
+  it('should not report success when merging documents as versions fails', () => {
+    let modal: NgbModalRef
+    modalService.activeInstances.subscribe((m) => (modal = m[0]))
+    jest.spyOn(permissionsService, 'currentUserCan').mockReturnValue(true)
+    jest
+      .spyOn(documentListViewService, 'documents', 'get')
+      .mockReturnValue([{ id: 3 }, { id: 4 }])
+    jest.spyOn(documentService, 'getFew').mockReturnValue(
+      of({
+        all: [3, 4],
+        count: 2,
+        results: [
+          { id: 3, title: 'Document 3' },
+          { id: 4, title: 'Document 4' },
+        ],
+      })
+    )
+    jest
+      .spyOn(documentListViewService, 'selected', 'get')
+      .mockReturnValue(new Set([3, 4]))
+    jest
+      .spyOn(documentService, 'mergeDocumentsAsVersions')
+      .mockReturnValue(throwError(() => new Error('failed')))
+    const toastInfoSpy = jest.spyOn(toastService, 'showInfo')
+    const toastErrorSpy = jest.spyOn(toastService, 'showError')
+    fixture.detectChanges()
+
+    component.mergeSelectedAsVersions()
+    modal.componentInstance.rootDocumentID.set(4)
+    modal.componentInstance.confirm()
+
+    expect(toastErrorSpy).toHaveBeenCalled()
+    expect(toastInfoSpy).not.toHaveBeenCalled()
   })
 
   it('should support bulk download with archive, originals or both and file formatting', () => {
@@ -1092,22 +1398,39 @@ describe('BulkEditorComponent', () => {
     component.downloadForm.get('downloadFileTypeArchive').patchValue(true)
     fixture.detectChanges()
     let downloadSpy = jest.spyOn(documentService, 'bulkDownload')
+    downloadSpy.mockReturnValue(of(new Blob()))
     //archive
     component.downloadSelected()
-    expect(downloadSpy).toHaveBeenCalledWith([3, 4], 'archive', false)
+    expect(downloadSpy).toHaveBeenCalledWith(
+      { documents: [3, 4] },
+      'archive',
+      false
+    )
     //originals
     component.downloadForm.get('downloadFileTypeArchive').patchValue(false)
     component.downloadForm.get('downloadFileTypeOriginals').patchValue(true)
     component.downloadSelected()
-    expect(downloadSpy).toHaveBeenCalledWith([3, 4], 'originals', false)
+    expect(downloadSpy).toHaveBeenCalledWith(
+      { documents: [3, 4] },
+      'originals',
+      false
+    )
     //both
     component.downloadForm.get('downloadFileTypeArchive').patchValue(true)
     component.downloadSelected()
-    expect(downloadSpy).toHaveBeenCalledWith([3, 4], 'both', false)
+    expect(downloadSpy).toHaveBeenCalledWith(
+      { documents: [3, 4] },
+      'both',
+      false
+    )
     //formatting
     component.downloadForm.get('downloadUseFormatting').patchValue(true)
     component.downloadSelected()
-    expect(downloadSpy).toHaveBeenCalledWith([3, 4], 'both', true)
+    expect(downloadSpy).toHaveBeenCalledWith(
+      { documents: [3, 4] },
+      'both',
+      true
+    )
 
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/bulk_download/`
@@ -1156,7 +1479,7 @@ describe('BulkEditorComponent', () => {
       },
     })
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -1195,7 +1518,7 @@ describe('BulkEditorComponent', () => {
 
     const modalInstance = {
       componentInstance: {
-        dialogMode: EditDialogMode.CREATE,
+        dialogMode: { set: jest.fn() },
         object: { name },
         succeeded: of(newTag),
       },
@@ -1238,7 +1561,7 @@ describe('BulkEditorComponent', () => {
 
     const modalInstance = {
       componentInstance: {
-        dialogMode: EditDialogMode.CREATE,
+        dialogMode: { set: jest.fn() },
         object: { name },
         succeeded: of(newCorrespondent),
       },
@@ -1287,7 +1610,7 @@ describe('BulkEditorComponent', () => {
 
     const modalInstance = {
       componentInstance: {
-        dialogMode: EditDialogMode.CREATE,
+        dialogMode: { set: jest.fn() },
         object: { name },
         succeeded: of(newDocumentType),
       },
@@ -1333,7 +1656,7 @@ describe('BulkEditorComponent', () => {
 
     const modalInstance = {
       componentInstance: {
-        dialogMode: EditDialogMode.CREATE,
+        dialogMode: { set: jest.fn() },
         object: { name },
         succeeded: of(newStoragePath),
       },
@@ -1387,7 +1710,7 @@ describe('BulkEditorComponent', () => {
 
     const modalInstance = {
       componentInstance: {
-        dialogMode: EditDialogMode.CREATE,
+        dialogMode: { set: jest.fn() },
         object: { name },
         succeeded: of(newCustomField),
       },
@@ -1453,6 +1776,8 @@ describe('BulkEditorComponent', () => {
 
     expect(modal.componentInstance.customFields.length).toEqual(2)
     expect(modal.componentInstance.fieldsToAddIds).toEqual([1, 2])
+    expect(modal.componentInstance.selection).toEqual({ documents: [3, 4] })
+    expect(modal.componentInstance.selectionCount).toEqual(2)
     expect(modal.componentInstance.documents).toEqual([3, 4])
 
     modal.componentInstance.failed.emit()
@@ -1463,7 +1788,7 @@ describe('BulkEditorComponent', () => {
     expect(toastServiceShowInfoSpy).toHaveBeenCalled()
     expect(listReloadSpy).toHaveBeenCalled()
     httpTestingController.match(
-      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true`
+      `${environment.apiBaseUrl}documents/?page=1&page_size=50&ordering=-created&truncate_content=true&include_selection_data=true`
     ) // list reload
     httpTestingController.match(
       `${environment.apiBaseUrl}documents/?page=1&page_size=100000&fields=id`
@@ -1484,15 +1809,18 @@ describe('BulkEditorComponent', () => {
       close: jest.fn(),
       componentInstance: {
         documents: [],
+        setDocuments(docs) {
+          this.documents = docs
+        },
         confirmClicked,
         payload: {
           document_ids: [5, 7],
           file_version: 'archive',
           expiration_days: 7,
         },
-        loading: false,
-        buttonsEnabled: true,
-        copied: false,
+        loading: signal(false),
+        buttonsEnabled: signal(true),
+        copied: signal(false),
       },
     }
 
@@ -1522,8 +1850,8 @@ describe('BulkEditorComponent', () => {
       file_version: 'archive',
       expiration_days: 7,
     })
-    expect(dialogInstance.loading).toBe(false)
-    expect(dialogInstance.buttonsEnabled).toBe(false)
+    expect(dialogInstance.loading()).toBe(false)
+    expect(dialogInstance.buttonsEnabled()).toBe(false)
     expect(dialogInstance.createdBundle).toEqual({ id: 42 })
     expect(typeof dialogInstance.onOpenManage).toBe('function')
     expect(toastInfoSpy).toHaveBeenCalledWith(
@@ -1553,14 +1881,17 @@ describe('BulkEditorComponent', () => {
     const modalRef: Partial<NgbModalRef> = {
       componentInstance: {
         documents: [],
+        setDocuments(docs) {
+          this.documents = docs
+        },
         confirmClicked,
         payload: {
           document_ids: [9],
           file_version: 'original',
           expiration_days: null,
         },
-        loading: false,
-        buttonsEnabled: true,
+        loading: signal(false),
+        buttonsEnabled: signal(true),
       },
     }
 
@@ -1581,8 +1912,8 @@ describe('BulkEditorComponent', () => {
       $localize`Share link bundle creation is not available yet.`,
       expect.any(Error)
     )
-    expect(dialogInstance.loading).toBe(false)
-    expect(dialogInstance.buttonsEnabled).toBe(true)
+    expect(dialogInstance.loading()).toBe(false)
+    expect(dialogInstance.buttonsEnabled()).toBe(true)
     openSpy.mockRestore()
   })
 

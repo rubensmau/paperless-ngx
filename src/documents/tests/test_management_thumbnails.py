@@ -2,6 +2,7 @@ import shutil
 from pathlib import Path
 from unittest import mock
 
+import pytest
 from django.core.management import call_command
 from django.test import TestCase
 
@@ -12,6 +13,7 @@ from documents.tests.utils import DirectoriesMixin
 from documents.tests.utils import FileSystemAssertsMixin
 
 
+@pytest.mark.management
 class TestMakeThumbnails(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
     def make_models(self) -> None:
         self.d1 = Document.objects.create(
@@ -83,13 +85,20 @@ class TestMakeThumbnails(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
     def test_command(self) -> None:
         self.assertIsNotFile(self.d1.thumbnail_path)
         self.assertIsNotFile(self.d2.thumbnail_path)
-        call_command("document_thumbnails", "--processes", "1")
+        call_command("document_thumbnails", "--processes", "1", skip_checks=True)
         self.assertIsFile(self.d1.thumbnail_path)
         self.assertIsFile(self.d2.thumbnail_path)
 
     def test_command_documentid(self) -> None:
         self.assertIsNotFile(self.d1.thumbnail_path)
         self.assertIsNotFile(self.d2.thumbnail_path)
-        call_command("document_thumbnails", "--processes", "1", "-d", f"{self.d1.id}")
+        call_command(
+            "document_thumbnails",
+            "--processes",
+            "1",
+            "-d",
+            f"{self.d1.id}",
+            skip_checks=True,
+        )
         self.assertIsFile(self.d1.thumbnail_path)
         self.assertIsNotFile(self.d2.thumbnail_path)

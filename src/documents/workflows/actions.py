@@ -1,5 +1,5 @@
 import logging
-import re
+import uuid
 from pathlib import Path
 
 from django.conf import settings
@@ -15,6 +15,7 @@ from documents.models import Document
 from documents.models import DocumentType
 from documents.models import WorkflowAction
 from documents.models import WorkflowTrigger
+from documents.plugins.base import StopConsumeTaskError
 from documents.signals import document_consumption_finished
 from documents.templating.workflows import parse_w_workflow_placeholders
 from documents.workflows.webhooks import send_webhook
@@ -251,12 +252,14 @@ def execute_webhook_action(
                         document.mime_type,
                     ),
                 }
-        send_webhook.delay(
-            url=action.webhook.url,
-            data=data,
-            headers=headers,
-            files=files,
-            as_json=action.webhook.as_json,
+        send_webhook.apply_async(
+            kwargs={
+                "url": action.webhook.url,
+                "data": data,
+                "headers": headers,
+                "files": files,
+                "as_json": action.webhook.as_json,
+            },
         )
         logger.debug(
             f"Webhook to {action.webhook.url} queued",
@@ -273,6 +276,7 @@ def execute_password_removal_action(
     action: WorkflowAction,
     document: Document | ConsumableDocument,
     logging_group,
+    source_file: Path | None = None,
 ) -> None:
     """
     Try to remove a password from a document using the configured list.
@@ -280,17 +284,13 @@ def execute_password_removal_action(
     passwords = action.passwords
     if not passwords:
         logger.warning(
-            "Password removal action %s has no passwords configured",
+            "Workflow action %s has no configured unlock values",
             action.pk,
             extra={"group": logging_group},
         )
         return
 
-    passwords = [
-        password.strip()
-        for password in re.split(r"[,\n]", passwords)
-        if password.strip()
-    ]
+    passwords = [p.strip() for p in passwords if p.strip()]
 
     if isinstance(document, ConsumableDocument):
         # hook the consumption-finished signal to attempt password removal later
@@ -301,6 +301,7 @@ def execute_password_removal_action(
                     action,
                     consumed_document,
                     logging_group,
+                    source_file=kwargs.get("original_file"),
                 )
             document_consumption_finished.disconnect(handler)
 
@@ -317,24 +318,56 @@ def execute_password_removal_action(
                 password=password,
                 update_document=True,
                 user=document.owner,
+                source_paths_by_id={document.id: source_file} if source_file else None,
             )
             logger.info(
-                "Removed password from document %s using workflow action %s",
+                "Unlocked document %s using workflow action %s",
                 document.pk,
                 action.pk,
                 extra={"group": logging_group},
             )
             return
-        except ValueError as e:
+        except ValueError:
             logger.warning(
-                "Password removal failed for document %s with supplied password: %s",
+                "Workflow action %s could not unlock document %s with one configured value",
+                action.pk,
                 document.pk,
-                e,
                 extra={"group": logging_group},
             )
 
     logger.error(
-        "Password removal failed for document %s after trying all provided passwords",
+        "Workflow action %s could not unlock document %s with any configured value",
+        action.pk,
         document.pk,
         extra={"group": logging_group},
     )
+
+
+def execute_move_to_trash_action(
+    action: WorkflowAction,
+    document: Document | ConsumableDocument,
+    logging_group: uuid.UUID | None,
+) -> None:
+    """
+    Execute a move to trash action for a workflow on an existing document or a
+    document in consumption. In case of an existing document it soft-deletes
+    the document. In case of consumption it aborts consumption and deletes the
+    file.
+    """
+    if isinstance(document, Document):
+        document.delete()
+        logger.debug(
+            f"Moved document {document} to trash",
+            extra={"group": logging_group},
+        )
+    else:
+        if document.original_file.exists():
+            document.original_file.unlink()
+        logger.info(
+            f"Workflow move to trash action triggered during consumption, "
+            f"deleting file {document.original_file}",
+            extra={"group": logging_group},
+        )
+        raise StopConsumeTaskError(
+            "Document deleted by workflow action during consumption",
+        )

@@ -4,7 +4,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
-import pytest
 from django.conf import settings
 from django.test import TestCase
 from django.test import override_settings
@@ -18,19 +17,12 @@ from documents.data_models import DocumentSource
 from documents.models import Document
 from documents.models import Tag
 from documents.plugins.base import StopConsumeTaskError
+from documents.tests.utils import ConsumeTaskMixin
 from documents.tests.utils import DirectoriesMixin
-from documents.tests.utils import DocumentConsumeDelayMixin
 from documents.tests.utils import DummyProgressManager
 from documents.tests.utils import FileSystemAssertsMixin
 from documents.tests.utils import SampleDirMixin
 from paperless.models import ApplicationConfiguration
-
-try:
-    import zxingcpp  # noqa: F401
-
-    HAS_ZXING_LIB = True
-except ImportError:
-    HAS_ZXING_LIB = False
 
 
 class GetReaderPluginMixin:
@@ -48,7 +40,6 @@ class GetReaderPluginMixin:
         reader.cleanup()
 
 
-@override_settings(CONSUMER_BARCODE_SCANNER="PYZBAR")
 class TestBarcode(
     DirectoriesMixin,
     FileSystemAssertsMixin,
@@ -95,7 +86,7 @@ class TestBarcode(
             self.assertDictEqual(separator_page_numbers, {1: False})
 
     @override_settings(CONSUMER_ENABLE_ASN_BARCODE=True)
-    def test_asn_barcode_duplicate_in_trash_fails(self):
+    def test_asn_barcode_duplicate_in_trash_fails(self) -> None:
         """
         GIVEN:
             - A document with ASN barcode 123 is in the trash
@@ -594,6 +585,7 @@ class TestBarcode(
             - The barcode config is used
         """
         app_config = ApplicationConfiguration.objects.first()
+        assert app_config is not None
         app_config.barcodes_enabled = True
         app_config.barcode_string = "CUSTOM BARCODE"
         app_config.save()
@@ -606,12 +598,11 @@ class TestBarcode(
             self.assertDictEqual(separator_page_numbers, {0: False})
 
 
-@override_settings(CONSUMER_BARCODE_SCANNER="PYZBAR")
 class TestBarcodeNewConsume(
     DirectoriesMixin,
     FileSystemAssertsMixin,
     SampleDirMixin,
-    DocumentConsumeDelayMixin,
+    ConsumeTaskMixin,
     TestCase,
 ):
     @override_settings(CONSUMER_ENABLE_BARCODES=True)
@@ -642,7 +633,7 @@ class TestBarcodeNewConsume(
                     ),
                     overrides,
                 ),
-                "Barcode splitting complete!",
+                {"reason": "Barcode splitting complete!"},
             )
             # 2 new document consume tasks created
             self.assertEqual(self.consume_file_mock.call_count, 2)
@@ -656,7 +647,7 @@ class TestBarcodeNewConsume(
             for (
                 new_input_doc,
                 new_doc_overrides,
-            ) in self.get_all_consume_delay_call_args():
+            ) in self.get_all_consume_task_call_args():
                 self.assertIsFile(new_input_doc.original_file)
                 self.assertEqual(new_input_doc.original_path, temp_copy)
                 self.assertEqual(new_input_doc.source, DocumentSource.ConsumeFolder)
@@ -781,39 +772,16 @@ class TestAsnBarcode(DirectoriesMixin, SampleDirMixin, GetReaderPluginMixin, Tes
             )
 
             document = Document.objects.first()
+            assert document is not None
 
             self.assertEqual(document.archive_serial_number, 123)
 
-    @override_settings(CONSUMER_BARCODE_SCANNER="PYZBAR")
     def test_scan_file_for_qrcode_without_upscale(self) -> None:
         """
         GIVEN:
             - A printed and scanned PDF document with a rather small QR code
         WHEN:
             - ASN barcode detection is run with default settings
-            - pyzbar is used for detection, as zxing would behave differently, and detect the QR code
-        THEN:
-            - ASN is not detected
-        """
-
-        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-asn-000123-upscale-dpi.pdf"
-
-        with self.get_reader(test_file) as reader:
-            reader.detect()
-            self.assertEqual(len(reader.barcodes), 0)
-
-    @override_settings(CONSUMER_BARCODE_SCANNER="PYZBAR")
-    @override_settings(CONSUMER_BARCODE_DPI=600)
-    @override_settings(CONSUMER_BARCODE_UPSCALE=1.5)
-    def test_scan_file_for_qrcode_with_upscale(self) -> None:
-        """
-        GIVEN:
-            - A printed and scanned PDF document with a rather small QR code
-        WHEN:
-            - ASN barcode detection is run with 600dpi and an upscale factor of 1.5 and pyzbar
-            - pyzbar is used for detection, as zxing would behave differently.
-              Upscaling is a workaround for detection problems with pyzbar,
-              when you cannot switch to zxing (aarch64 build problems of zxing)
         THEN:
             - ASN 123 is detected
         """
@@ -825,23 +793,24 @@ class TestAsnBarcode(DirectoriesMixin, SampleDirMixin, GetReaderPluginMixin, Tes
             self.assertEqual(len(reader.barcodes), 1)
             self.assertEqual(reader.asn, 123)
 
+    @override_settings(CONSUMER_BARCODE_DPI=600)
+    @override_settings(CONSUMER_BARCODE_UPSCALE=1.5)
+    def test_scan_file_for_qrcode_with_upscale(self) -> None:
+        """
+        GIVEN:
+            - A printed and scanned PDF document with a rather small QR code
+        WHEN:
+            - ASN barcode detection is run with 600dpi and an upscale factor of 1.5
+        THEN:
+            - ASN 123 is detected
+        """
 
-@pytest.mark.skipif(
-    not HAS_ZXING_LIB,
-    reason="No zxingcpp",
-)
-@override_settings(CONSUMER_BARCODE_SCANNER="ZXING")
-class TestBarcodeZxing(TestBarcode):
-    pass
+        test_file = self.BARCODE_SAMPLE_DIR / "barcode-qr-asn-000123-upscale-dpi.pdf"
 
-
-@pytest.mark.skipif(
-    not HAS_ZXING_LIB,
-    reason="No zxingcpp",
-)
-@override_settings(CONSUMER_BARCODE_SCANNER="ZXING")
-class TestAsnBarcodesZxing(TestAsnBarcode):
-    pass
+        with self.get_reader(test_file) as reader:
+            reader.detect()
+            self.assertEqual(len(reader.barcodes), 1)
+            self.assertEqual(reader.asn, 123)
 
 
 class TestTagBarcode(DirectoriesMixin, SampleDirMixin, GetReaderPluginMixin, TestCase):
@@ -952,6 +921,7 @@ class TestTagBarcode(DirectoriesMixin, SampleDirMixin, GetReaderPluginMixin, Tes
     @override_settings(
         CONSUMER_ENABLE_TAG_BARCODE=True,
         CONSUMER_TAG_BARCODE_MAPPING={"ASN(.*)": "\\g<1>"},
+        CONSUMER_ENABLE_ASN_BARCODE=False,
     )
     def test_scan_file_for_many_custom_tags(self) -> None:
         """
@@ -1052,7 +1022,7 @@ class TestTagBarcode(DirectoriesMixin, SampleDirMixin, GetReaderPluginMixin, Tes
         CONSUMER_TAG_BARCODE_SPLIT=True,
         CONSUMER_TAG_BARCODE_MAPPING={"TAG:(.*)": "\\g<1>"},
         CELERY_TASK_ALWAYS_EAGER=True,
-        OCR_MODE="skip",
+        OCR_MODE="auto",
     )
     def test_consume_barcode_file_tag_split_and_assignment(self) -> None:
         """
@@ -1081,7 +1051,7 @@ class TestTagBarcode(DirectoriesMixin, SampleDirMixin, GetReaderPluginMixin, Tes
                 None,
             )
 
-            self.assertEqual(result, "Barcode splitting complete!")
+            self.assertEqual(result, {"reason": "Barcode splitting complete!"})
 
             documents = Document.objects.all().order_by("id")
             self.assertEqual(documents.count(), 3)
@@ -1091,11 +1061,15 @@ class TestTagBarcode(DirectoriesMixin, SampleDirMixin, GetReaderPluginMixin, Tes
 
             doc2 = documents[1]
             self.assertEqual(doc2.tags.count(), 1)
-            self.assertEqual(doc2.tags.first().name, "invoice")
+            _tag_1 = doc2.tags.first()
+            assert _tag_1 is not None
+            self.assertEqual(_tag_1.name, "invoice")
 
             doc3 = documents[2]
             self.assertEqual(doc3.tags.count(), 1)
-            self.assertEqual(doc3.tags.first().name, "receipt")
+            _tag_2 = doc3.tags.first()
+            assert _tag_2 is not None
+            self.assertEqual(_tag_2.name, "receipt")
 
     @override_settings(
         CONSUMER_ENABLE_TAG_BARCODE=True,
